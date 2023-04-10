@@ -13,6 +13,7 @@ class MuZeroNetwork(nn.Module):
         self.input_shape = input_shape
         self.action_space = action_space
         self.state_space = input_shape[0]
+        self.discount_factor = 0.99
 
         self.representation = nn.Sequential(
             nn.Linear(input_shape[0], 512),
@@ -48,43 +49,46 @@ class MuZeroNetwork(nn.Module):
         return self.representation(x)
     
     def next_state(self, s, a):
-        print("s.shape:", s.shape)
-        print("one_hot_action.shape:", torch.zeros(s.shape[0], self.action_space, device=device).scatter_(1, a.unsqueeze(1), 1).shape)
         a = a.to(device).long()  # Convert action to long tensor
         a = a.view(-1, 1)  # Reshape action tensor
-        x = torch.cat((s, torch.zeros(s.shape[0], self.action_space, device=device).scatter_(1, a.unsqueeze(1), 1)), dim=1)
-        print("x.shape:", x.shape)
+        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).unsqueeze(0).to(device)
 
+        x = torch.cat((s, one_hot_action), dim=1)
         return self.dynamics_state(x)
 
     def reward(self, s, a):
         a = a.to(device).long()  # Convert action to long tensor
         a = a.view(-1, 1)  # Reshape action tensor
-        x = torch.cat((s, torch.zeros(s.shape[0], self.action_space, device=device).scatter_(1, a, 1)), dim=1)  # Create one-hot action tensor and concatenate it with state tensor
+        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).unsqueeze(0).to(device)
+
+
+
+
+        x = torch.cat((s, one_hot_action), dim=1)
+
+
         return self.dynamics_reward(x)
     
     def policy_value(self, s):
-        hidden_state = self.representation(s)
-        policy_logits = self.policy(hidden_state)
-        value = self.value(hidden_state)
+        policy_logits = self.policy(s)  # Use 's' directly
+        value = self.value(s)  # Use 's' directly
 
         return policy_logits, value.squeeze(0)
 
-        
     def generate_training_data(self, trajectories):
         """
         Converts trajectories into training data.
         """
         training_data = []
-        for state, action, reward, done in trajectories:
+        for obs, state, action, reward, done in trajectories:  # Add 'state' to the loop variables
             target_action = torch.zeros(self.action_space, device=device)
             target_action[action] = 1.0
-            next_state_representation = self.representation(state)  # Change this line
-            target_value = reward + (1 - done) * self.discount_factor * self.value(next_state_representation)
-            training_data.append((state, target_action, target_value))
+            obs = torch.tensor(obs, dtype=torch.float32, device=device).view(1, -1)  # Convert 'obs' to a tensor
+            next_state_representation = self.representation(obs)  # Use 'obs' instead of 'state'
+            target_value = (reward + (1 - done) * self.discount_factor * self.value(next_state_representation)).squeeze()
+
+            training_data.append((state, target_action, target_value))  # Use 'state' instead of 'obs'
         return training_data
-
-
 
     def update(self, training_data, batch_size):
         """
@@ -102,7 +106,8 @@ class MuZeroNetwork(nn.Module):
             states, target_actions, target_values = zip(*batch)
             states = torch.stack(states)
             target_actions = torch.stack(target_actions)
-            target_values = torch.stack(target_values)
+            target_values = torch.stack(target_values).view(-1, 1, 1)
+
 
             optimizer.zero_grad()
 
@@ -110,7 +115,8 @@ class MuZeroNetwork(nn.Module):
             policy, value = self.policy_value(states)
 
             # Compute the loss
-            action_loss = nn.BCEWithLogitsLoss()(policy, target_actions)
+            action_loss = nn.BCEWithLogitsLoss()(policy.squeeze(1), target_actions)
+
             value_loss = nn.MSELoss()(value, target_values)
             loss = action_loss + value_loss
             # Backpropagate the loss
@@ -135,10 +141,8 @@ class Node:
 
 
 class MCTS:
-    def __init__(self, network, env, num_simulations, discount_factor=0.99, exploration_weight=1.0):
-        self.network = network
-        self.env = env  # Store the environment as an instance variable
-        
+    def __init__(self, network, num_simulations, discount_factor=0.99, exploration_weight=1.0):
+        self.network = network     
         self.num_simulations = num_simulations
         self.discount_factor = discount_factor
         self.exploration_weight = exploration_weight
@@ -151,21 +155,22 @@ class MCTS:
             value = self.expand_and_evaluate(node, action_history, state)
             self.backpropagate(node, value, action_history)
 
-        return self.select_action(root)  # Call select_action on the instance
-  
+        return root  # Return the root object
 
     def select(self, node, state):
         action_history = []
 
-        while node.expanded():
+        while True:
+            if not node.expanded():  # Move the if-statement here
+                break
             action, node = self.select_child(node)
-            if node.expanded():  # Add this if-statement
-                action_tensor = torch.tensor([action], dtype=torch.float32, device=device)
-                action_tensor = action_tensor.unsqueeze(0)
-                state = self.network.next_state(state, action_tensor)  # Pass the 'state' variable to the 'next_state' function
-                action_history.append(action)
+            action_tensor = torch.tensor([action], dtype=torch.float32, device=device)
+            action_tensor = action_tensor.unsqueeze(0)
+            state = self.network.next_state(state, action_tensor)  # Pass the 'state' variable to the 'next_state' function
+            action_history.append(action)
 
         return node, action_history
+
 
     def select_child(self, node):
         max_score = -float("inf")
@@ -188,11 +193,12 @@ class MCTS:
         return list(range(self.network.action_space))
 
     def expand_and_evaluate(self, node, action_history, state):  # Add state as an input
-        next_hidden_state, reward, done = self.apply_action(state, action_history, self.env)
+        next_hidden_state, reward, done = self.apply_action(state, action_history)
         policy_logits, value = self.network.policy_value(next_hidden_state)
         legal_actions = self.legal_actions(action_history)
         policy_logits = policy_logits.view(-1, self.network.action_space)
-        policy = {a: np.exp(policy_logits[a].item()) for a in legal_actions}
+        policy = {a: np.exp(policy_logits[0, a].cpu().detach().numpy()) for a in legal_actions}
+
         policy_sum = sum(policy.values())
         for a in legal_actions:
             policy[a] /= policy_sum
@@ -203,15 +209,16 @@ class MCTS:
         return value
 
 
-
     def backpropagate(self, node, value, action_history):
         for action in reversed(action_history):
-            node.value_sum += value
-            node.visit_count += 1
-            value *= self.discount_factor
-            node = node.children[action]
+            if action in node.children:
+                node.value_sum += value
+                node.visit_count += 1
+                value *= self.discount_factor
+                node = node.children[action]
 
-    def apply_action(self, hidden_state, action_history, env):  # Add env as an input
+
+    def apply_action(self, hidden_state, action_history):  # Add env as an input
         total_reward = 0
         done = False
         for action in action_history:
@@ -222,21 +229,17 @@ class MCTS:
             reward = self.network.reward(hidden_state, action_one_hot)
             total_reward += reward.item()
 
-            _, _, done, _ = env.step(action)  # Get the done flag from the environment
-            if done:
-                break
-
         return hidden_state, total_reward, done
 
 
-    def select_action(self, root):
-        max_visits = -float("inf")
-        best_action = -1
+    def select_action(self, root, temperature=1.0):  # Add the temperature parameter
+        visit_counts = np.array(
+    [child.visit_count for child in root.children.values()], dtype=np.float32
+)
 
-        for action, child in root.children.items():
-            if child.visit_count > max_visits:
-                max_visits = child.visit_count
-                best_action = action
+        visit_counts = visit_counts**(1/temperature)  # Apply temperature scaling
+        visit_counts /= visit_counts.sum()  # Normalize visit_counts to get probabilities
+        best_action = np.random.choice(list(root.children.keys()), p=visit_counts)
 
         return best_action
 
@@ -255,7 +258,7 @@ batch_size = 64
 
 # Initialize MuZero network and MCTS
 muzero = muzero_net
-mcts = MCTS(muzero, env, num_simulations)  # Add 'env' as an argument
+mcts = MCTS(muzero, num_simulations)  # Add 'env' as an argument
 
 
 # Training loop
@@ -264,20 +267,20 @@ for episode in range(num_episodes):
 
     obs, _ = env.reset()
     obs = torch.tensor(obs, dtype=torch.float32, device=device).view(1, -1)
-
+    print("obs.shape:", obs.shape)
     state = muzero.representation(obs)
     done = False
     episode_reward = 0
     trajectories = []
 
     while not done:
-        root = mcts.run(state)
-        action = mcts.select_action(root, temperature)
-        obs, reward, done, _ = env.step(action)
-        obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        next_state = muzero.representation(obs)
-        trajectories.append((state, action, reward, done))
-
+        root_node = mcts.run(state)
+        action = mcts.select_action(root_node, temperature)
+        obs, reward, done, _, _ = env.step(action)
+        next_obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        next_state = muzero.representation(next_obs)
+        trajectories.append((obs, state, action, reward, done))  # Store both 'obs' and 'state'
+        #print(done)
         state = next_state
         episode_reward += reward
 

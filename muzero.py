@@ -5,7 +5,12 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import gc
 
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
+torch.autograd.set_detect_anomaly(False)
 
 class MuZeroNetwork(nn.Module):
     def __init__(self, input_shape, action_space):
@@ -20,30 +25,27 @@ class MuZeroNetwork(nn.Module):
             nn.ReLU()
         )
 
-        self.dynamics_state = nn.Sequential(
-            nn.Linear(512 + self.action_space, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU()
-        )
+        self.lstm_hidden_size = 512
+        self.lstm = nn.LSTM(input_size=512 + self.action_space, hidden_size=self.lstm_hidden_size, num_layers=1, batch_first=True)
+        self.lstm_state = None
 
         self.dynamics_reward = nn.Sequential(
-            nn.Linear(512 + self.action_space, 512),
+            nn.Linear(self.lstm_hidden_size, 512),
             nn.ReLU(),
             nn.Linear(512, 1)
         )
+
         self.policy = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(self.lstm_hidden_size, 512),
             nn.ReLU(),
             nn.Linear(512, self.action_space)
         )
 
         self.value = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(self.lstm_hidden_size, 512),
             nn.ReLU(),
             nn.Linear(512, 1)
         )
-
 
     def initial_state(self, x):
         return self.representation(x)
@@ -51,23 +53,28 @@ class MuZeroNetwork(nn.Module):
     def next_state(self, s, a):
         a = a.to(device).long()  # Convert action to long tensor
         a = a.view(-1, 1)  # Reshape action tensor
-        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).unsqueeze(0).to(device)
+        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).to(device)
 
-        x = torch.cat((s, one_hot_action), dim=1)
-        return self.dynamics_state(x)
+        one_hot_action = one_hot_action.unsqueeze(0)  # Add extra dimension
+
+        x = torch.cat((s, one_hot_action), dim=1).unsqueeze(0)  # Add extra dimension for sequence length
+        lstm_out, self.lstm_state = self.lstm(x, self.lstm_state)
+        self.lstm_state = (self.lstm_state[0].detach(), self.lstm_state[1].detach())  # Detach the LSTM state
+        return lstm_out.squeeze(0)
+
+
 
     def reward(self, s, a):
         a = a.to(device).long()  # Convert action to long tensor
         a = a.view(-1, 1)  # Reshape action tensor
-        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).unsqueeze(0).to(device)
+        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).to(device)
+        one_hot_action = one_hot_action.unsqueeze(0)  # Add extra dimension
+        x = torch.cat((s, one_hot_action), dim=1).unsqueeze(0)  # Add extra dimension for sequence length
 
+        lstm_out, self.lstm_state = self.lstm(x, self.lstm_state)
+        self.lstm_state = (self.lstm_state[0].detach(), self.lstm_state[1].detach())  # Detach the LSTM state
+        return self.dynamics_reward(lstm_out.squeeze(0)).squeeze()
 
-
-
-        x = torch.cat((s, one_hot_action), dim=1)
-
-
-        return self.dynamics_reward(x)
     
     def policy_value(self, s):
         policy_logits = self.policy(s)  # Use 's' directly
@@ -85,7 +92,13 @@ class MuZeroNetwork(nn.Module):
             target_action[action] = 1.0
             obs = torch.tensor(obs, dtype=torch.float32, device=device).view(1, -1)  # Convert 'obs' to a tensor
             next_state_representation = self.representation(obs)  # Use 'obs' instead of 'state'
-            target_value = (reward + (1 - done) * self.discount_factor * self.value(next_state_representation)).squeeze()
+            
+            temp_value = self.value(next_state_representation)
+            scaled_value = (1 - done) * self.discount_factor * temp_value
+            unsqueezed_reward = torch.tensor(reward).unsqueeze(-1)
+
+            target_value = (unsqueezed_reward + scaled_value).squeeze()
+
 
             training_data.append((state, target_action, target_value))  # Use 'state' instead of 'obs'
         return training_data
@@ -121,6 +134,14 @@ class MuZeroNetwork(nn.Module):
             loss = action_loss + value_loss
             # Backpropagate the loss
             loss.backward()
+            '''
+            print("Loss:", loss.item())
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5)
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    print(name, param.grad.norm().item())
+
+            '''
             # Update the network weights
             optimizer.step()
 
@@ -283,6 +304,7 @@ for episode in range(num_episodes):
         #print(done)
         state = next_state
         episode_reward += reward
+  
 
 
     print(f"Episode {episode}, Reward: {episode_reward}")
@@ -292,4 +314,6 @@ for episode in range(num_episodes):
     muzero.update(training_data, batch_size)
 
     # Decay the temperature parameter over time (optional)
-    temperature *= 0.99
+    temperature = temperature * 0.99
+    gc.collect()
+

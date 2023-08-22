@@ -1,148 +1,129 @@
-import gym
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Categorical
-import gc
+import gym
+import random
+from collections import namedtuple
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Hyperparameters
+epochs = 1000
+learning_rate = 0.01
+gamma = 0.99
 
-seed = 42
-torch.manual_seed(seed)
-np.random.seed(seed)
-torch.autograd.set_detect_anomaly(True)
+# Define the environment
+env = gym.make('CartPole-v1')
+input_dim = env.observation_space.shape[0]
+action_dim = env.action_space.n
+hidden_dim = 128
 
-class MuZeroNetwork(nn.Module):
-    def __init__(self, input_shape, action_space):
-        super(MuZeroNetwork, self).__init__()
-        self.input_shape = input_shape
-        self.action_space = action_space
-        self.state_space = input_shape[0]
-        self.discount_factor = 0.99
+Transition = namedtuple('Transition', ('obs', 'action', 'reward', 'next_obs', 'done', 'mcts_policy'))
 
-        self.representation = nn.Sequential(
-            nn.Linear(input_shape[0], 512),
-            nn.ReLU()
-        )
+class ReplayBuffer:
+    def __init__(self, capacity=10000):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
 
-        self.dynamics = nn.Sequential(
-            nn.Linear(512 + self.action_space, 512),
-            nn.ReLU()
-        )
+    def push(self, trajectory):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = trajectory
+        self.position = (self.position + 1) % self.capacity
 
-        self.prediction = nn.Sequential(
-            nn.Linear(512, self.action_space)
-        )
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
 
-        self.value = nn.Sequential(
-            nn.Linear(512, 1)
-        )
+    def __len__(self):
+        return len(self.buffer)
 
-    def initial_state(self, x):
-        return self.representation(x)
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_value = nn.Linear(hidden_dim, 1)
+        self.fc_policy = nn.Linear(hidden_dim, action_dim)
+        self.fc_reward = nn.Linear(hidden_dim, 1)
 
-    def recurrent_state(self, s, a):
-        a = a.to(device).long()
-        a = a.view(-1, 1)
-        one_hot_action = torch.nn.functional.one_hot(a.squeeze().long(), num_classes=self.action_space).to(device)
+    def policy_value_reward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        policy_logits = self.fc_policy(x)
+        value = self.fc_value(x)
+        reward = self.fc_reward(x)
+        return policy_logits, value, reward
 
-        s = s.repeat(one_hot_action.size(0), 1)
-        x = torch.cat((s, one_hot_action), dim=1)
+class MuZero:
+    def __init__(self, net, num_simulations=50):
+        self.net = net
+        self.num_simulations = num_simulations
 
-        return self.dynamics(x)
+    def select_action(self, obs):
+        root = Node(0)
+        state = torch.tensor(obs, dtype=torch.float32)
+        mcts_policy = self.run_mcts(root, state.detach())
+        action = max(root.children.items(), key=lambda item: item[1].visits)[0]
+        return action, mcts_policy
 
-    def value_and_reward(self, s):
-        value = self.value(s).squeeze()
-        policy = self.prediction(s).squeeze()
-        return value, policy
+    def run_mcts(self, node, state):
+        if not node.children:
+            policy_logits, value, _ = self.net.policy_value_reward(state.unsqueeze(0))
+            policy = F.softmax(policy_logits, dim=-1)
+            node.children = {a: Node(p.item()) for a, p in enumerate(policy[0])}
+            return value.item()
 
+        action, child = max(node.children.items(), key=lambda item: ucb_score(node, item[1]))
+        _, _, reward = self.net.policy_value_reward(state)
+        value = reward.item() + self.run_mcts(child, state)  # Use the reward prediction
 
-    def generate_training_data(self, trajectories):
-        training_data = []
-        for obs, state, action, reward, done in trajectories:
-            target_action = torch.zeros(self.action_space, device=device)
-            target_action[action] = 1.0
-            obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            next_state_representation = self.representation(obs)
+        child.value_sum += value
+        child.visits += 1
+        return value
 
-            value, _ = self.value_and_reward(next_state_representation)
-            target_value = reward + (1 - done) * self.discount_factor * value
+    def update(self, replay_buffer, batch_size, optimizer):
+        if len(replay_buffer) < batch_size:
+            return
+        trajectories = replay_buffer.sample(batch_size)
+        for trajectory in trajectories:
+            obses, actions, rewards, next_obses, dones, mcts_policies = zip(*trajectory)
 
-            # Ensure target_value is a tensor with at least one dimension
-            target_value = target_value.unsqueeze(0)
+            obses = torch.tensor(obses, dtype=torch.float32)
+            actions = torch.tensor(actions, dtype=torch.long)
+            rewards = torch.tensor(rewards, dtype=torch.float32)
+            mcts_policies = torch.tensor(mcts_policies, dtype=torch.float32)
 
-            training_data.append((state, target_action, target_value))
-
-        return training_data
-
-
-    def update(self, training_data, batch_size):
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
-
-        batches = [
-            training_data[i: i + batch_size]
-            for i in range(0, len(training_data), batch_size)
-        ]
-
-        for batch in batches:
-            states, target_actions, target_values = zip(*batch)
-            states = torch.stack(states)
-            target_actions = torch.stack(target_actions).squeeze(1) # Remove unnecessary dimension
-            target_values = torch.cat(target_values).unsqueeze(1)
+            policy_logits, values, predicted_rewards = self.net.policy_value_reward(obses)
+            value_loss = F.mse_loss(values.squeeze(), rewards + gamma * torch.roll(rewards, -1))
+            policy_loss = F.cross_entropy(policy_logits, actions)
+            reward_loss = F.mse_loss(predicted_rewards.squeeze(), rewards)
+            
+            loss = value_loss + policy_loss + reward_loss
 
             optimizer.zero_grad()
-
-            value, policy = self.value_and_reward(states)
-
-            value_loss = nn.MSELoss()(value, target_values)
-            policy_loss = nn.BCEWithLogitsLoss()(policy, target_actions)
-
-            loss = value_loss + policy_loss
-
             loss.backward()
             optimizer.step()
 
+def train():
+    net = Net()
+    muzero = MuZero(net)
+    replay_buffer = ReplayBuffer()
+    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
 
-env = gym.make("CartPole-v1")
+    for epoch in range(epochs):
+        obs = env.reset()
+        total_reward = 0
+        done = False
+        trajectory = []
+        while not done:
+            action, mcts_policy = muzero.select_action(obs)
+            next_obs, reward, done, _ = env.step(action)
+            total_reward += reward
+            trajectory.append(Transition(obs, action, reward, next_obs, done, mcts_policy))
+            obs = next_obs
+        replay_buffer.push(trajectory)
+        muzero.update(replay_buffer, 64, optimizer)
+        print(f"Epoch {epoch + 1}, Total Reward: {total_reward}")
 
-input_shape = (4,)
-n_actions = 2
-muzero_net = MuZeroNetwork(input_shape, n_actions).to(device)
-
-num_episodes = 5000
-num_simulations = 50
-batch_size = 64
-
-muzero = muzero_net
-
-for episode in range(num_episodes):
-    print(f"Starting Episode {episode}")
-
-    obs = env.reset()
-    obs = torch.tensor(obs, dtype=torch.float32, device=device).view(1, -1)
-    state = muzero.initial_state(obs)
-    done = False
-    episode_reward = 0
-    trajectories = []
-
-    while not done:
-        value, policy = muzero.value_and_reward(state)
-        action = torch.distributions.Categorical(logits=policy).sample().item()
-
-        next_obs, reward, done, _ = env.step(action)
-        next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0)
-        next_state = muzero.initial_state(next_obs)
-
-        trajectories.append((obs, state, action, reward, done))
-
-        obs = next_obs
-        state = next_state
-        episode_reward += reward
-
-    print(f"Episode {episode}, Reward: {episode_reward}")
-
-    training_data = muzero.generate_training_data(trajectories)
-    muzero.update(training_data, batch_size)
-
-    gc.collect()
+train()

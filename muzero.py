@@ -55,6 +55,22 @@ class Net(nn.Module):
         reward = self.fc_reward(x)
         return policy_logits, value, reward
 
+class Node:
+    def __init__(self, prior):
+        self.prior = prior
+        self.children = {}
+        self.value_sum = 0
+        self.visits = 0
+
+    @property
+    def value(self):
+        return self.value_sum / self.visits if self.visits > 0 else 0
+
+def ucb_score(parent, child):
+    pb_c = np.log((parent.visits + 1) / parent.visits) + np.log(2)
+    pb_c = np.sqrt(pb_c)
+    return -child.value + pb_c * child.prior
+
 class MuZero:
     def __init__(self, net, num_simulations=50):
         self.net = net

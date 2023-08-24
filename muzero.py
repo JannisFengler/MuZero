@@ -8,7 +8,7 @@ import random
 from collections import namedtuple
 
 # Hyperparameters
-epochs = 1000
+epochs = 100000
 learning_rate = 0.01
 gamma = 0.99
 
@@ -21,7 +21,7 @@ hidden_dim = 128
 Transition = namedtuple('Transition', ('obs', 'action', 'reward', 'next_obs', 'done', 'mcts_policy'))
 
 class ReplayBuffer:
-    def __init__(self, capacity=10000):
+    def __init__(self, capacity=3000):
         self.capacity = capacity
         self.buffer = []
         self.position = 0
@@ -72,18 +72,20 @@ def ucb_score(parent, child):
     return -child.value + pb_c * child.prior
 
 class MuZero:
-    def __init__(self, net, num_simulations=50):
+    def __init__(self, net, num_simulations=100):
         self.net = net
         self.num_simulations = num_simulations
 
     def select_action(self, obs):
         root = Node(0)
         state = torch.tensor(obs, dtype=torch.float32)
-        mcts_policy = self.run_mcts(root, state.detach())
+        mcts_policy = self.run_mcts(root, state.detach(), False)
         action = max(root.children.items(), key=lambda item: item[1].visits)[0]
         return action, mcts_policy
 
-    def run_mcts(self, node, state):
+    def run_mcts(self, node, state, done):
+        if done:
+            return 0
         if not node.children:
             policy_logits, value, _ = self.net.policy_value_reward(state.unsqueeze(0))
             policy = F.softmax(policy_logits, dim=-1)
@@ -92,7 +94,7 @@ class MuZero:
 
         action, child = max(node.children.items(), key=lambda item: ucb_score(node, item[1]))
         _, _, reward = self.net.policy_value_reward(state)
-        value = reward.item() + self.run_mcts(child, state)  # Use the reward prediction
+        value = reward.item() + self.run_mcts(child, state, done)
 
         child.value_sum += value
         child.visits += 1
@@ -100,7 +102,7 @@ class MuZero:
 
     def update(self, replay_buffer, batch_size, optimizer):
         if len(replay_buffer) < batch_size:
-            return
+            return 0, 0, 0
         trajectories = replay_buffer.sample(batch_size)
         for trajectory in trajectories:
             obses, actions, rewards, next_obses, dones, mcts_policies = zip(*trajectory)
@@ -114,12 +116,27 @@ class MuZero:
             value_loss = F.mse_loss(values.squeeze(), rewards + gamma * torch.roll(rewards, -1))
             policy_loss = F.cross_entropy(policy_logits, actions)
             reward_loss = F.mse_loss(predicted_rewards.squeeze(), rewards)
-            
+
             loss = value_loss + policy_loss + reward_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        
+        return value_loss.item(), policy_loss.item(), reward_loss.item()
+
+def evaluate(muzero, num_episodes=10):
+    total_rewards = 0
+    for _ in range(num_episodes):
+        obs = env.reset()
+        done = False
+        episode_reward = 0
+        while not done:
+            action, _ = muzero.select_action(obs)
+            obs, reward, done, _ = env.step(action)
+            episode_reward += reward
+        total_rewards += episode_reward
+    return total_rewards / num_episodes
 
 def train():
     net = Net()
@@ -139,7 +156,11 @@ def train():
             trajectory.append(Transition(obs, action, reward, next_obs, done, mcts_policy))
             obs = next_obs
         replay_buffer.push(trajectory)
-        muzero.update(replay_buffer, 64, optimizer)
-        print(f"Epoch {epoch + 1}, Total Reward: {total_reward}")
+        
+        value_loss, policy_loss, reward_loss = muzero.update(replay_buffer, 64, optimizer)
+        
+        if (epoch + 1) % 500 == 0:
+            eval_reward = evaluate(muzero)
+            print(f"Epoch {epoch + 1}, Total Reward: {total_reward}, Eval Reward: {eval_reward}, Value Loss: {value_loss}, Policy Loss: {policy_loss}, Reward Loss: {reward_loss}")
 
 train()

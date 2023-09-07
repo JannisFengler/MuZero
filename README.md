@@ -1,2 +1,2 @@
 # ReinforcementLearning
-Some Reinforcement Learning Algorithns
+A Muzero implementation

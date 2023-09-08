@@ -8,7 +8,7 @@ import random
 from collections import namedtuple
 
 # Hyperparameters
-epochs = 100000
+epochs = 10000
 learning_rate = 0.01
 gamma = 0.99
 

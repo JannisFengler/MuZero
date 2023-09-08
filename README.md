@@ -1,2 +1,2 @@
 # ReinforcementLearning
-A Muzero implementation in pytorch
+A Muzero implementation in Pytorch

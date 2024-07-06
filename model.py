@@ -1,153 +1,402 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
-from collections import deque
-import random
 import numpy as np
+from typing import List, Tuple
 
-class ReplayBuffer:
-    """Buffer to store gameplay experiences."""
-    def __init__(self, capacity=100000):
-        self.buffer = deque(maxlen=capacity)
+class NetworkOutput:
+    def __init__(self, value, reward, policy_logits, hidden_state):
+        self.value = value
+        self.reward = reward
+        self.policy_logits = policy_logits
+        self.hidden_state = hidden_state
 
-    def add(self, experience):
-        self.buffer.append(experience)
+    def scalar_value(self):
+        return support_to_scalar(self.value, self.value.shape[-1] // 2).item()
 
-    def sample(self, batch_size):
-        return random.sample(self.buffer, min(len(self.buffer), batch_size))
+    def scalar_reward(self):
+        return support_to_scalar(self.reward, self.reward.shape[-1] // 2).item() if self.reward is not None else None
 
-    def size(self):
-        return len(self.buffer)
 
 class RepresentationNetwork(nn.Module):
-    """Neural network to encode the observation into a hidden state."""
-    def __init__(self):
+    def __init__(self, observation_shape, num_blocks, num_channels):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1),  # Assuming the input has one channel
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU()
-        )
-        self.flatten = nn.Flatten()
-        # Example input to determine output size
-        example_input = torch.zeros((1, 1, 84, 84))  # Update the size according to your input dimension
-        example_output = self.conv(example_input)
-        output_size = example_output.numel()
-        self.fc = nn.Linear(output_size, 256)
+        self.conv1 = nn.Conv2d(observation_shape[0], num_channels, kernel_size=3, stride=2, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        self.resblocks = nn.ModuleList([ResidualBlock(num_channels) for _ in range(num_blocks)])
 
     def forward(self, x):
-        x = x.unsqueeze(1)  # Assuming x is missing the channel dimension
-        x = self.conv(x)
-        x = self.flatten(x)
-        x = self.fc(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        for block in self.resblocks:
+            x = block(x)
         return x
-    
-class DynamicsNetwork(nn.Module):
-    def __init__(self):
+
+class MuZeroNetwork(nn.Module):
+    def __init__(self, observation_shape, action_space_size, num_blocks, num_channels, support_size):
         super().__init__()
-        self.action_embedding = nn.Embedding(10, 10)
-        self.transition = nn.Sequential(
-            nn.Linear(256 + 10, 256),
-            nn.ReLU()
-        )
-        self.reward_predictor = nn.Linear(256, 1)
-        self.terminal_predictor = nn.Linear(256, 1)
+        self.action_space_size = action_space_size
+        self.num_channels = num_channels
+        self.support_size = support_size
 
-    def forward(self, state, action):
-        # Flatten the state tensor
-        state_flat = state.view(state.size(0), -1)
+        self.representation = RepresentationNetwork(observation_shape, num_blocks, num_channels)
+        self.dynamics = DynamicsNetwork(num_channels, num_blocks, action_space_size, support_size)
+        self.prediction = PredictionNetwork(num_channels, action_space_size, support_size)
 
-        # Embedding the action
-        action_emb = self.action_embedding(action)
+    def initial_inference(self, observation) -> NetworkOutput:
+        hidden_state = self.representation(observation)
+        policy_logits, value = self.prediction(hidden_state)
+        return NetworkOutput(value, None, policy_logits, hidden_state)
 
-        # Concatenating along the feature dimension
-        x = torch.cat([state_flat, action_emb], dim=1)
-
-        next_state = self.transition(x)
-        reward = self.reward_predictor(next_state)
-        terminal = torch.sigmoid(self.terminal_predictor(next_state))
-        return next_state, reward, terminal > 0.5
-
+    def recurrent_inference(self, hidden_state, action=None) -> NetworkOutput:
+        next_hidden_state, reward = self.dynamics(hidden_state, action)
+        policy_logits, value = self.prediction(next_hidden_state)
+        return NetworkOutput(value, reward, policy_logits, next_hidden_state)
 
 class PredictionNetwork(nn.Module):
-    """Neural network to predict the policy and value."""
-    def __init__(self):
+    def __init__(self, num_channels, action_space_size, support_size):
         super().__init__()
-        self.policy = nn.Linear(256, 10)
-        self.value = nn.Linear(256, 1)
+        self.conv = nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1, padding=1)
+        self.bn = nn.BatchNorm2d(num_channels)
+        self.fc_policy = nn.Linear(num_channels, action_space_size)
+        self.fc_value = nn.Linear(num_channels, 2 * support_size + 1)
 
-    def forward(self, state):
-        policy_logits = self.policy(state)
-        value_estimate = self.value(state)
-        return policy_logits.squeeze(1), value_estimate.squeeze(1)
+    def forward(self, x):
+        x = F.relu(self.bn(self.conv(x)))
+        x = x.mean(dim=(2, 3))  # Global average pooling
+        policy_logits = self.fc_policy(x)
+        value = self.fc_value(x)
+        return policy_logits, value
+
+class DynamicsNetwork(nn.Module):
+    def __init__(self, num_channels, num_blocks, action_space_size, support_size):
+        super().__init__()
+        self.action_space_size = action_space_size
+        self.conv = nn.Conv2d(num_channels + action_space_size, num_channels, kernel_size=3, stride=1, padding=1)
+        self.bn = nn.BatchNorm2d(num_channels)
+        self.resblocks = nn.ModuleList([ResidualBlock(num_channels) for _ in range(num_blocks)])
+        self.reward_head = nn.Linear(num_channels, 2 * support_size + 1)
+
+    def forward(self, hidden_state, action=None):
+        batch_size = hidden_state.size(0)
+        if action is not None:
+            action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device)
+            action_one_hot.scatter_(1, action.view(batch_size, 1, 1, 1).expand(-1, -1, hidden_state.size(2), hidden_state.size(3)), 1)
+        else:
+            action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device)
+        
+        x = torch.cat([hidden_state, action_one_hot], dim=1)
+        x = F.relu(self.bn(self.conv(x)))
+        for block in self.resblocks:
+            x = block(x)
+        reward = self.reward_head(x.mean(dim=(2, 3)))
+        return x, reward
+
+class ResidualBlock(nn.Module):
+    def __init__(self, num_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(num_channels)
+
+    def forward(self, x):
+        residual = x
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        x += residual
+        x = F.relu(x)
+        return x
 
 class Node:
-    """A node in the MCTS tree."""
-    def __init__(self, prior):
+    def __init__(self, prior, hidden_state):
         self.visit_count = 0
         self.prior = prior
         self.value_sum = 0
         self.children = {}
+        self.hidden_state = hidden_state
+        self.reward = 0
+
+    def expanded(self):
+        return len(self.children) > 0
 
     def value(self):
-        return self.value_sum / self.visit_count if self.visit_count > 0 else 0
+        if self.visit_count == 0:
+            return 0
+        return self.value_sum / self.visit_count
 
-    def expand(self, action_priors):
-        for i, prior in enumerate(action_priors.tolist()):
-            if i not in self.children:
-                self.children[i] = Node(prior)
+    def update(self, value):
+        self.value_sum += value
+        self.visit_count += 1
+    add_value = update  # Alias for compatibility
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = []
+        self.capacity = capacity
+        self.position = 0
 
-    def select(self, total_visits):
-        c1 = 1.25
-        c2 = 19652
-        log_denom = math.log((total_visits + c2 + 1) / c2)
-        best_action = max(self.children.items(),
-                          key=lambda item: item[1].value() + item[1].prior * 
-                          (math.sqrt(total_visits) / (1 + item[1].visit_count)) * 
-                          (c1 + log_denom))
-        return best_action[0]
+    def save_game(self, game):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(game)
+        else:
+            self.buffer[self.position] = game
+        self.position = (self.position + 1) % self.capacity
 
-def mcts(root, model, state, num_simulations, buffer):
-    """Perform the Monte Carlo Tree Search algorithm."""
-    for _ in range(num_simulations):
-        node = root
-        search_path = [node]
-        initial_state = state.clone()
+    def sample_batch(self, num_unroll_steps: int, td_steps: int) -> List:
+        games = self.sample_games(num_unroll_steps + td_steps)
+        game_pos = [(g, self.sample_position(g)) for g in games]
+        return [(g.make_image(i), g.history[i:i + num_unroll_steps],
+                 g.make_target(i, num_unroll_steps, td_steps, g.to_play()))
+                for (g, i) in game_pos]
 
-        while node.children:
-            total_visits = sum(child.visit_count for child in node.children.values())
-            action = node.select(total_visits)
-            next_state, reward, is_terminal = simulate(model, state, action)
-            buffer.add((state.clone(), action, reward, next_state.clone(), is_terminal))
-            state = next_state
+    def sample_games(self, num_unroll_steps):
+        return np.random.choice(self.buffer, num_unroll_steps)
 
-            if is_terminal:
-                node = node.children.get(action)
-                if node is None:
-                    node = Node(0.0)
-                    root.children[action] = node
+    def sample_position(self, game) -> int:
+        return np.random.randint(len(game.history))
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+class MinMaxStats:
+    def __init__(self):
+        self.maximum = -float('inf')
+        self.minimum = float('inf')
+
+    def update(self, value: float):
+        self.maximum = max(self.maximum, value)
+        self.minimum = min(self.minimum, value)
+
+    def normalize(self, value: float) -> float:
+        if self.maximum > self.minimum:
+            return (value - self.minimum) / (self.maximum - self.minimum)
+        return value
+
+class MCTS:
+    def __init__(self, config):
+        self.config = config
+
+    def run(self, root: Node, action_space_size: int, network: MuZeroNetwork, min_max_stats: MinMaxStats) -> Node:
+        #print(f"Root node type: {type(root)}")  # Debug print
+        if root.hidden_state is None:
+            raise ValueError("Root node must have a hidden state")
+
+        for i in range(self.config.num_simulations):
+            #print(f"Starting simulation {i+1}")  # Debug print
+            node = root
+            search_path = [node]
+            current_tree_depth = 0
+
+            while node.expanded():
+                current_tree_depth += 1
+                action, node = self.select_child(node, min_max_stats)
                 search_path.append(node)
-                break
 
-            node = node.children.get(action)
-            if node is None:
-                policy, _ = model['prediction'](state)
-                node = Node(0.0)
-                node.expand(policy.squeeze(0))
-                root.children[action] = node
-            search_path.append(node)
+            # We've reached a leaf node, expand it
+            parent = search_path[-1]
+            with torch.no_grad():
+                network_output = network.recurrent_inference(parent.hidden_state)
+            self.expand_node(parent, action_space_size, network_output)
+            
+            value = network_output.scalar_value()
+            reward = network_output.scalar_reward()
+            #print(f"Backpropagating with value: {value}, reward: {reward}")  # Debug print
+            self.backpropagate(search_path, value, reward if reward is not None else 0, min_max_stats)
 
-        state = initial_state
+        return root
 
+    def select_child(self, node: Node, min_max_stats: MinMaxStats) -> Tuple[int, Node]:
+        _, action, child = max((self.ucb_score(node, child, min_max_stats), action, child)
+                                for action, child in node.children.items())
+        return action, child
+
+    def ucb_score(self, parent: Node, child: Node, min_max_stats: MinMaxStats) -> float:
+        pb_c = math.log((parent.visit_count + self.config.pb_c_base + 1) / self.config.pb_c_base) + self.config.pb_c_init
+        pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
+
+        prior_score = pb_c * child.prior
+        value_score = min_max_stats.normalize(child.value())
+        return prior_score + value_score
+
+    def expand_node(self, node: Node, action_space_size: int, network_output: NetworkOutput):
+        node.hidden_state = network_output.hidden_state
+        node.reward = network_output.scalar_reward() if network_output.reward is not None else 0.0
+        policy = torch.softmax(network_output.policy_logits, dim=1).squeeze(0).detach().cpu().numpy()
+        for action in range(action_space_size):
+            node.children[action] = Node(prior=policy[action], hidden_state=network_output.hidden_state)
+
+    def backpropagate(self, search_path: List[Node], value: float, reward: float, min_max_stats: MinMaxStats):
         for node in reversed(search_path):
-            node.visit_count += 1
-            node.value_sum += reward
+            node.update(value)
+            min_max_stats.update(node.value())
+            value = node.reward + self.config.discount * value
 
-    # Return the action with the highest visit count
-    return max(root.children.items(), key=lambda item: item[1].visit_count)[0]
 
-def simulate(model, state, action):
-    """Simulate the next state and reward based on the current state and action."""
-    action_tensor = torch.tensor([action], dtype=torch.long)
-    return model['dynamics'](state, action_tensor)
+def support_to_scalar(logits, support_size):
+    """Transform a categorical representation to a scalar"""
+    probabilities = torch.softmax(logits, dim=-1)
+    support = torch.arange(-support_size, support_size + 1).to(logits.device)
+    x = torch.sum(support * probabilities, dim=-1)
+    return x.item()  # Return a scalar value
+
+def select_action(config, root: Node, temperature: float) -> int:
+    if not root.children:
+        return np.random.randint(config.action_space_size)
+    
+    visit_counts = [child.visit_count for child in root.children.values()]
+    actions = [action for action in root.children.keys()]
+    if temperature == 0:
+        action = actions[np.argmax(visit_counts)]
+    elif temperature == float('inf'):
+        action = np.random.choice(actions)
+    else:
+        # See paper appendix Data Generation
+        visit_count_distribution = np.array(visit_counts) ** (1 / temperature)
+        visit_count_distribution = visit_count_distribution / sum(visit_count_distribution)
+        action = np.random.choice(actions, p=visit_count_distribution)
+    
+    return action
+
+def scalar_to_support(x, support_size):
+    """
+    Transform a scalar to a categorical representation with (2 * support_size + 1) categories
+    """
+    x = torch.clamp(x, -support_size, support_size)
+    floor = x.floor()
+    prob = x - floor
+    logits = torch.zeros(*x.shape, 2 * support_size + 1, device=x.device)
+    logits.scatter_(-1, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1))
+    indexes = floor + support_size + 1
+    prob = prob.masked_fill_(indexes > 2 * support_size, 0.0)
+    indexes = indexes.masked_fill_(indexes > 2 * support_size, 0.0)
+    logits.scatter_(-1, indexes.long().unsqueeze(-1), prob.unsqueeze(-1))
+    return logits
+
+def support_to_scalar(logits, support_size):
+    """
+    Transform a categorical representation to a scalar
+    """
+    probabilities = torch.softmax(logits, dim=-1)
+    support = torch.arange(-support_size, support_size + 1).to(logits.device)
+    x = torch.sum(support * probabilities, dim=-1)
+    return x
+
+def update_weights(optimizer: torch.optim.Optimizer, network: MuZeroNetwork, batch, config):
+    loss = 0
+    value_loss, reward_loss, policy_loss = 0, 0, 0
+
+    for image, actions, targets in batch:
+        # Initial step
+        network_output = network.initial_inference(image)
+        hidden_state = network_output.hidden_state
+        predictions = [(1.0, network_output)]
+
+        # Recurrent steps
+        for action in actions:
+            network_output = network.recurrent_inference(hidden_state, action)
+            hidden_state = network_output.hidden_state
+            predictions.append((1.0 / len(actions), network_output))
+
+        for prediction, target in zip(predictions, targets):
+            gradient_scale, network_output = prediction
+            target_value, target_reward, target_policy = target
+
+            value_loss += config.value_loss_weight * gradient_scale * scalar_to_support_loss(
+                network_output.value, target_value, config.support_size
+            )
+
+            if network_output.reward is not None:
+                reward_loss += config.reward_loss_weight * gradient_scale * scalar_to_support_loss(
+                    network_output.reward, target_reward, config.support_size
+                )
+
+            policy_loss += config.policy_loss_weight * gradient_scale * F.cross_entropy(
+                network_output.policy_logits,
+                torch.tensor(target_policy).to(network_output.policy_logits.device)
+)
+    loss = value_loss + reward_loss + policy_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(network.parameters(), config.max_grad_norm)
+    optimizer.step()
+
+    return (loss.item(), value_loss.item(), reward_loss.item(), policy_loss.item())
+
+def scalar_to_support_loss(logits, scalar, support_size):
+    """
+    Transform a scalar to a categorical representation and compute cross-entropy with the logits
+    """
+    scalar_support = scalar_to_support(scalar.unsqueeze(-1), support_size).squeeze(-1)
+    return F.cross_entropy(logits, torch.argmax(scalar_support, dim=1))
+
+class MuZeroConfig:
+    def __init__(self):
+        # Game
+        self.action_space_size = None
+        self.num_players = None
+
+        # Network
+        self.observation_shape = None
+        self.support_size = 300
+        self.num_blocks = 6
+        self.num_channels = 128
+
+        # Self-Play
+        self.num_actors = 1
+        self.max_moves = 512
+        self.num_simulations = 20
+
+        # Root prior exploration noise
+        self.root_dirichlet_alpha = 0.3
+        self.root_exploration_fraction = 0.25
+
+        # UCB formula
+        self.pb_c_base = 19652
+        self.pb_c_init = 1.25
+
+        # Training
+        self.training_steps = int(1000e3)
+        self.checkpoint_interval = int(1e3)
+        self.batch_size = 1024
+        self.num_unroll_steps = 5
+        self.td_steps = 10
+
+        # Replay Buffer
+        self.replay_buffer_size = int(1e6)
+        self.num_workers = 4
+
+        # Optimization
+        self.weight_decay = 1e-4
+        self.momentum = 0.9
+        self.lr_init = 0.05
+
+        # Exponential learning rate schedule
+        self.lr_decay_rate = 0.1
+        self.lr_decay_steps = 350e3
+
+        # Evaluation
+        self.discount = 0.997
+        self.value_loss_weight = 0.25
+        self.reward_loss_weight = 1.0
+        self.policy_loss_weight = 1.0
+        self.max_grad_norm = 5
+
+        # Environment
+        self.num_envs = 8
+
+    def visit_softmax_temperature_fn(self, trained_steps):
+        if trained_steps < 500e3:
+            return 1.0
+        elif trained_steps < 750e3:
+            return 0.5
+        else:
+            return 0.25
+
+    def set_game(self, env_name):
+        if env_name == 'atari':
+            self.action_space_size = 6  # This is correct for Pong
+            self.num_players = 1
+            self.observation_shape = (4, 84, 84)  # 4 stacked frames, each 84x84
+        else:
+            raise ValueError(f"Unknown game: {env_name}")

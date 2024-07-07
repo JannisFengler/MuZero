@@ -72,7 +72,7 @@ class ReplayBuffer:
         games = [self.sample_game() for _ in range(self.batch_size)]
         game_pos = [(g, self.sample_position(g)) for g in games]
 
-        return [(g.make_image(i), g.history[i:i + num_unroll_steps],
+        return [(g.make_image(i), g.action_history[i:i + num_unroll_steps],
                  g.make_target(i, num_unroll_steps, td_steps, g.to_play_history[i]))
                 for (g, i) in game_pos]
 
@@ -80,10 +80,62 @@ class ReplayBuffer:
         return np.random.choice(self.buffer)
 
     def sample_position(self, game):
-        return np.random.randint(len(game.history))
+        return np.random.randint(len(game.action_history))
 
     def __len__(self):
         return len(self.buffer)
+
+def play_game(config, network, device):
+    game = GameHistory(config)
+    env = make_atari_env(config.env_name)
+    observation = env.reset()
+    game.observation_history.append(observation)
+    done = False
+
+    print("Starting new game")
+    step = 0
+    while not done and step < config.max_moves:
+        step += 1
+        
+        observation_tensor = process_observation(observation, device)
+
+        with torch.no_grad():
+            initial_inference = network.initial_inference(observation_tensor)
+        
+        root = Node(prior=0, hidden_state=initial_inference.hidden_state)
+
+        mcts = MCTS(config)
+        mcts.run(root, config.action_space_size, network, MinMaxStats())
+
+        game.store_search_statistics(root, config.action_space_size)
+
+        action = select_action(config, root, step)
+
+        try:
+            next_observation, reward, done, info = env.step(action)
+        except ValueError:
+            next_observation, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+
+        game.observation_history.append(next_observation)
+        game.action_history.append(action)
+        game.reward_history.append(reward)
+        game.to_play_history.append(1)  # Assuming single-player game
+
+        observation = next_observation
+
+    print(f"Game completed. Game length: {step}, Total reward: {sum(game.reward_history)}")
+    
+    return game
+
+def play_multiple_games(config, network, device, num_games):
+    games = []
+    for game_id in range(num_games):
+        print(f"Starting game {game_id + 1}/{num_games}")
+        game = play_game(config, network, device)
+        games.append(game)
+        print(f"Game {game_id + 1} completed. Total reward: {sum(game.reward_history)}, Length: {len(game.action_history)}")
+    return games
 
 def train_muzero(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -119,27 +171,27 @@ def train_muzero(config):
         print(f"Starting training step {training_step}")
         
         # Self-play
-        if training_step % config.self_play_interval == 0:
-            print(f"Starting self-play game at step {training_step}")
-            game = play_game(config, network, device)
-            replay_buffer.save_game(game)
-            total_games += 1
-            total_steps += len(game.action_history)
-            print(f"Game {total_games} completed. Total reward: {sum(game.reward_history)}, Length: {len(game.action_history)}")
-            writer.add_scalar('Game/TotalReward', sum(game.reward_history), total_games)
-            writer.add_scalar('Game/Length', len(game.action_history), total_games)
+        if len(replay_buffer) < config.batch_size * config.games_per_training_step:
+            print(f"Starting self-play at step {training_step}")
+            games = play_multiple_games(config, network, device, config.games_per_training_step)
+            for game in games:
+                replay_buffer.save_game(game)
+                total_games += 1
+                total_steps += len(game.action_history)
+                writer.add_scalar('Game/TotalReward', sum(game.reward_history), total_games)
+                writer.add_scalar('Game/Length', len(game.action_history), total_games)
             writer.add_scalar('Training/TotalGames', total_games, training_step)
             writer.add_scalar('Training/TotalGameSteps', total_steps, training_step)
-            print(f"Finished self-play game. Replay buffer size: {len(replay_buffer)}")
+            print(f"Finished self-play. Replay buffer size: {len(replay_buffer)}")
 
-        if len(replay_buffer) > config.batch_size:
+        # Training
+        if len(replay_buffer) >= config.batch_size:
             print(f"Sampling batch from replay buffer. Buffer size: {len(replay_buffer)}")
             batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
             losses = update_weights(optimizer, network, batch, config)
             log_losses(writer, losses, training_step)
             print(f"Updated weights. Losses: {losses}")
 
-            # Learning rate scheduling
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
             writer.add_scalar('Training/LearningRate', current_lr, training_step)
@@ -172,54 +224,6 @@ def train_muzero(config):
     writer.close()
     print("Training completed")
 
-def play_game(config, network, device):
-    game = GameHistory(config)
-    env = make_atari_env(config.env_name)
-    observation = env.reset()
-    game.observation_history.append(observation)
-    done = False
-
-    print("Starting new game")
-    step = 0
-    while not done and step < config.max_moves:
-        step += 1
-        
-        observation_tensor = process_observation(observation, device)
-
-        # Perform initial inference to get the hidden state
-        with torch.no_grad():
-            initial_inference = network.initial_inference(observation_tensor)
-        
-        root = Node(prior=0, hidden_state=initial_inference.hidden_state)
-
-        # MCTS
-        mcts = MCTS(config)
-        mcts.run(root, config.action_space_size, network, MinMaxStats())
-
-        # Store MCTS statistics
-        game.store_search_statistics(root, config.action_space_size)
-
-        # Select action
-        action = select_action(config, root, step)
-
-        # Step environment
-        try:
-            next_observation, reward, done, info = env.step(action)
-        except ValueError:
-            next_observation, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-
-        game.observation_history.append(next_observation)
-        game.action_history.append(action)
-        game.reward_history.append(reward)
-        game.to_play_history.append(1)  # Assuming single-player game
-
-        observation = next_observation
-
-    print(f"Game completed. Game length: {step}, Total reward: {sum(game.reward_history)}")
-    
-    return game
-
 def evaluate_model(network, writer, training_step, config, device):
     env = make_atari_env(config.env_name)
     rewards = []
@@ -237,7 +241,6 @@ def evaluate_model(network, writer, training_step, config, device):
             step += 1
             observation_tensor = process_observation(observation, device)
             
-            # Perform initial inference to get the hidden state
             with torch.no_grad():
                 initial_inference = network.initial_inference(observation_tensor)
             
@@ -275,7 +278,6 @@ def evaluate_model(network, writer, training_step, config, device):
     return avg_reward, avg_length
 
 def process_observation(observation, device):
-    """Convert observation to tensor and move to device."""
     if isinstance(observation, gym.wrappers.frame_stack.LazyFrames):
         observation_array = np.array(observation)
     elif isinstance(observation, np.ndarray):
@@ -285,16 +287,15 @@ def process_observation(observation, device):
     else:
         raise ValueError(f"Unexpected observation type: {type(observation)}")
     
-    # Ensure the observation is in the correct shape (Channel, Height, Width)
     if len(observation_array.shape) == 3:
-        if observation_array.shape[-1] == 3 or observation_array.shape[-1] == 4:  # If the last dimension is 3 or 4, it's likely (H, W, C)
+        if observation_array.shape[-1] == 3 or observation_array.shape[-1] == 4:
             observation_array = np.transpose(observation_array, (2, 0, 1))
-    elif len(observation_array.shape) == 4:  # If it's already (N, C, H, W), do nothing
+    elif len(observation_array.shape) == 4:
         pass
     else:
         raise ValueError(f"Unexpected observation shape: {observation_array.shape}")
     
-    return torch.FloatTensor(observation_array).unsqueeze(0).to(device)  # Add batch dimension
+    return torch.FloatTensor(observation_array).unsqueeze(0).to(device)
 
 def log_metrics(training_step, network, replay_buffer, writer, config, optimizer):
     writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], training_step)
@@ -369,6 +370,7 @@ if __name__ == '__main__':
     # Network architecture (you may need to adjust these based on your MuZeroNetwork implementation)
     config.encoding_size = 128
     config.hidden_size = 256
+    config.games_per_training_step = 10  # Number of games to play before each training step
     
     config.checkpoint_dir = './checkpoints'
     os.makedirs(config.checkpoint_dir, exist_ok=True)

@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import math
 import numpy as np
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 class NetworkOutput:
     def __init__(self, value, reward, policy_logits, hidden_state):
@@ -175,35 +177,45 @@ class MinMaxStats:
 class MCTS:
     def __init__(self, config):
         self.config = config
+        self.lock = threading.Lock()
 
     def run(self, root: Node, action_space_size: int, network: MuZeroNetwork, min_max_stats: MinMaxStats) -> Node:
-        #print(f"Root node type: {type(root)}")  # Debug print
         if root.hidden_state is None:
             raise ValueError("Root node must have a hidden state")
 
-        for i in range(self.config.num_simulations):
-            #print(f"Starting simulation {i+1}")  # Debug print
-            node = root
-            search_path = [node]
-            current_tree_depth = 0
-
-            while node.expanded():
-                current_tree_depth += 1
-                action, node = self.select_child(node, min_max_stats)
-                search_path.append(node)
-
-            # We've reached a leaf node, expand it
-            parent = search_path[-1]
-            with torch.no_grad():
-                network_output = network.recurrent_inference(parent.hidden_state)
-            self.expand_node(parent, action_space_size, network_output)
-            
-            value = network_output.scalar_value()
-            reward = network_output.scalar_reward()
-            #print(f"Backpropagating with value: {value}, reward: {reward}")  # Debug print
-            self.backpropagate(search_path, value, reward if reward is not None else 0, min_max_stats)
+        with ThreadPoolExecutor(max_workers=self.config.num_mcts_workers) as executor:
+            for _ in range(0, self.config.num_simulations, self.config.num_mcts_workers):
+                futures = []
+                for _ in range(self.config.num_mcts_workers):
+                    futures.append(executor.submit(self.run_single_simulation, root, action_space_size, network, min_max_stats))
+                
+                # Wait for all simulations in this batch to complete
+                for future in futures:
+                    future.result()
 
         return root
+
+    def run_single_simulation(self, root: Node, action_space_size: int, network: MuZeroNetwork, min_max_stats: MinMaxStats):
+        node = root
+        search_path = [node]
+        current_tree_depth = 0
+
+        while node.expanded():
+            current_tree_depth += 1
+            action, node = self.select_child(node, min_max_stats)
+            search_path.append(node)
+
+        # We've reached a leaf node, expand it
+        parent = search_path[-1]
+        with torch.no_grad():
+            network_output = network.recurrent_inference(parent.hidden_state)
+        
+        with self.lock:
+            self.expand_node(parent, action_space_size, network_output)
+        
+        value = network_output.scalar_value()
+        reward = network_output.scalar_reward()
+        self.backpropagate(search_path, value, reward if reward is not None else 0, min_max_stats)
 
     def select_child(self, node: Node, min_max_stats: MinMaxStats) -> Tuple[int, Node]:
         _, action, child = max((self.ucb_score(node, child, min_max_stats), action, child)
@@ -227,7 +239,8 @@ class MCTS:
 
     def backpropagate(self, search_path: List[Node], value: float, reward: float, min_max_stats: MinMaxStats):
         for node in reversed(search_path):
-            node.update(value)
+            with self.lock:
+                node.update(value)
             min_max_stats.update(node.value())
             value = node.reward + self.config.discount * value
 
@@ -361,6 +374,7 @@ class MuZeroConfig:
         self.batch_size = 1024
         self.num_unroll_steps = 5
         self.td_steps = 10
+        self.num_mcts_workers = 16
 
         # Replay Buffer
         self.replay_buffer_size = int(1e6)

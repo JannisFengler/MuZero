@@ -20,7 +20,6 @@ class NetworkOutput:
     def scalar_reward(self):
         return support_to_scalar(self.reward, self.reward.shape[-1] // 2).item() if self.reward is not None else None
 
-
 class RepresentationNetwork(nn.Module):
     def __init__(self, observation_shape, num_blocks, num_channels):
         super().__init__()
@@ -29,6 +28,7 @@ class RepresentationNetwork(nn.Module):
         self.resblocks = nn.ModuleList([ResidualBlock(num_channels) for _ in range(num_blocks)])
 
     def forward(self, x):
+        x = x.to(torch.bfloat16)  # Ensure input is in BF16
         x = F.relu(self.bn1(self.conv1(x)))
         for block in self.resblocks:
             x = block(x)
@@ -64,6 +64,7 @@ class PredictionNetwork(nn.Module):
         self.fc_value = nn.Linear(num_channels, 2 * support_size + 1)
 
     def forward(self, x):
+        x = x.to(torch.bfloat16)  # Ensure input is in BF16
         x = F.relu(self.bn(self.conv(x)))
         x = x.mean(dim=(2, 3))  # Global average pooling
         policy_logits = self.fc_policy(x)
@@ -80,12 +81,13 @@ class DynamicsNetwork(nn.Module):
         self.reward_head = nn.Linear(num_channels, 2 * support_size + 1)
 
     def forward(self, hidden_state, action=None):
+        hidden_state = hidden_state.to(torch.bfloat16)  # Ensure hidden state is in BF16
         batch_size = hidden_state.size(0)
         if action is not None:
-            action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device)
+            action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device, dtype=torch.bfloat16)
             action_one_hot.scatter_(1, action.view(batch_size, 1, 1, 1).expand(-1, -1, hidden_state.size(2), hidden_state.size(3)), 1)
         else:
-            action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device)
+            action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device, dtype=torch.bfloat16)
         
         x = torch.cat([hidden_state, action_one_hot], dim=1)
         x = F.relu(self.bn(self.conv(x)))
@@ -103,6 +105,7 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(num_channels)
 
     def forward(self, x):
+        x = x.to(torch.bfloat16)  # Ensure input is in BF16
         residual = x
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
@@ -130,7 +133,7 @@ class Node:
     def update(self, value):
         self.value_sum += value
         self.visit_count += 1
-    add_value = update  # Alias for compatibility
+
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = []
@@ -233,7 +236,8 @@ class MCTS:
     def expand_node(self, node: Node, action_space_size: int, network_output: NetworkOutput):
         node.hidden_state = network_output.hidden_state
         node.reward = network_output.scalar_reward() if network_output.reward is not None else 0.0
-        policy = torch.softmax(network_output.policy_logits, dim=1).squeeze(0).detach().cpu().numpy()
+        policy_logits = network_output.policy_logits.to(torch.float32)  # Convert to float32 for softmax
+        policy = torch.softmax(policy_logits, dim=1).squeeze(0).detach().cpu().numpy()
         for action in range(action_space_size):
             node.children[action] = Node(prior=policy[action], hidden_state=network_output.hidden_state)
 
@@ -244,11 +248,10 @@ class MCTS:
             min_max_stats.update(node.value())
             value = node.reward + self.config.discount * value
 
-
 def support_to_scalar(logits, support_size):
     """Transform a categorical representation to a scalar"""
     probabilities = torch.softmax(logits, dim=-1)
-    support = torch.arange(-support_size, support_size + 1).to(logits.device)
+    support = torch.arange(-support_size, support_size + 1).to(logits.device, dtype=torch.bfloat16)
     x = torch.sum(support * probabilities, dim=-1)
     return x.item()  # Return a scalar value
 
@@ -277,7 +280,7 @@ def scalar_to_support(x, support_size):
     x = torch.clamp(x, -support_size, support_size)
     floor = x.floor()
     prob = x - floor
-    logits = torch.zeros(*x.shape, 2 * support_size + 1, device=x.device)
+    logits = torch.zeros(*x.shape, 2 * support_size + 1, device=x.device, dtype=torch.bfloat16)
     logits.scatter_(-1, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1))
     indexes = floor + support_size + 1
     prob = prob.masked_fill_(indexes > 2 * support_size, 0.0)
@@ -290,7 +293,7 @@ def support_to_scalar(logits, support_size):
     Transform a categorical representation to a scalar
     """
     probabilities = torch.softmax(logits, dim=-1)
-    support = torch.arange(-support_size, support_size + 1).to(logits.device)
+    support = torch.arange(-support_size, support_size + 1).to(logits.device, dtype=torch.bfloat16)
     x = torch.sum(support * probabilities, dim=-1)
     return x
 
@@ -299,6 +302,7 @@ def update_weights(optimizer: torch.optim.Optimizer, network: MuZeroNetwork, bat
     value_loss, reward_loss, policy_loss = 0, 0, 0
 
     for image, actions, targets in batch:
+        image = image.to(torch.bfloat16)  # Ensure input is in BF16
         # Initial step
         network_output = network.initial_inference(image)
         hidden_state = network_output.hidden_state
@@ -326,7 +330,8 @@ def update_weights(optimizer: torch.optim.Optimizer, network: MuZeroNetwork, bat
             policy_loss += config.policy_loss_weight * gradient_scale * F.cross_entropy(
                 network_output.policy_logits,
                 torch.tensor(target_policy).to(network_output.policy_logits.device)
-)
+            )
+
     loss = value_loss + reward_loss + policy_loss
 
     optimizer.zero_grad()

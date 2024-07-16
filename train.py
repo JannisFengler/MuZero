@@ -3,7 +3,7 @@
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from model import MuZeroNetwork, MCTS, select_action, update_weights, MuZeroConfig, MinMaxStats, Node
+from model import MuZeroNetwork, MCTS, select_action, update_weights, MuZeroConfig, MinMaxStats, Node, ReplayBuffer
 import gym
 from gym.wrappers import AtariPreprocessing, FrameStack
 import numpy as np
@@ -14,8 +14,10 @@ from datetime import datetime
 import gc
 import psutil
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class GameHistory:
-    def __init__(self, config):
+    def __init__(self, config: MuZeroConfig):
         self.observation_history = []
         self.action_history = []
         self.reward_history = []
@@ -25,7 +27,7 @@ class GameHistory:
         self.reanalysed_predicted_root_values = None
         self.config = config
 
-    def store_search_statistics(self, root, action_space):
+    def store_search_statistics(self, root: Node, action_space: int):
         sum_visits = sum(child.visit_count for child in root.children.values())
         self.child_visits.append([
             root.children[a].visit_count / sum_visits if a in root.children else 0
@@ -33,10 +35,10 @@ class GameHistory:
         ])
         self.root_values.append(root.value())
 
-    def make_image(self, state_index):
+    def make_image(self, state_index: int):
         return self.observation_history[state_index]
 
-    def make_target(self, state_index, num_unroll_steps, td_steps, to_play):
+    def make_target(self, state_index: int, num_unroll_steps: int, td_steps: int, to_play: int):
         targets = []
         for current_index in range(state_index, state_index + num_unroll_steps + 1):
             bootstrap_index = current_index + td_steps
@@ -48,46 +50,18 @@ class GameHistory:
             if current_index < len(self.root_values):
                 targets.append((value, self.reward_history[current_index], self.child_visits[current_index]))
             else:
-                targets.append((0, 0, []))
+                targets.append((0, 0, [0] * self.config.action_space_size))
 
         return targets
 
-    def compute_target_value(self, current_index, bootstrap_index):
+    def compute_target_value(self, current_index: int, bootstrap_index: int) -> float:
         bootstrap_value = self.root_values[bootstrap_index]
         value = bootstrap_value * self.config.discount ** (bootstrap_index - current_index)
         for i, reward in enumerate(self.reward_history[current_index:bootstrap_index]):
             value += reward * self.config.discount ** i
         return value
 
-class ReplayBuffer:
-    def __init__(self, config):
-        self.window_size = config.window_size
-        self.batch_size = config.batch_size
-        self.buffer = deque([], maxlen=self.window_size)
-
-    def save_game(self, game):
-        if len(self.buffer) == self.window_size:
-            self.buffer.popleft()
-        self.buffer.append(game)
-
-    def sample_batch(self, num_unroll_steps, td_steps):
-        games = [self.sample_game() for _ in range(self.batch_size)]
-        game_pos = [(g, self.sample_position(g)) for g in games]
-
-        return [(g.make_image(i), g.action_history[i:i + num_unroll_steps],
-                 g.make_target(i, num_unroll_steps, td_steps, g.to_play_history[i]))
-                for (g, i) in game_pos]
-
-    def sample_game(self):
-        return np.random.choice(self.buffer)
-
-    def sample_position(self, game):
-        return np.random.randint(len(game.action_history))
-
-    def __len__(self):
-        return len(self.buffer)
-
-def play_games(config, network, device, num_games):
+def play_games(config: MuZeroConfig, network: MuZeroNetwork, device: torch.device, num_games: int):
     envs = gym.vector.AsyncVectorEnv([lambda: make_atari_env(config.env_name) for _ in range(num_games)])
     observations, infos = envs.reset()
     print(f"Initial observations: {observations}")
@@ -119,7 +93,7 @@ def play_games(config, network, device, num_games):
         actions = np.array(actions)
         results = envs.step(actions)
         observations, rewards, dones = results[0], results[1], results[2]
-        print(f"Step {steps}: observations: {observations}, rewards: {rewards}, dones: {dones}")
+        print(f"Step {steps}: rewards: {rewards}, dones: {dones}")
 
         for i, game in enumerate(games):
             if not dones[i]:
@@ -134,7 +108,7 @@ def play_games(config, network, device, num_games):
     return games
 
 
-def train_muzero(config):
+def train_muzero(config: MuZeroConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -216,7 +190,7 @@ def train_muzero(config):
     writer.close()
     print("Training completed")
 
-def evaluate_model(network, writer, training_step, config, device):
+def evaluate_model(network: MuZeroNetwork, writer: SummaryWriter, training_step: int, config: MuZeroConfig, device: torch.device):
     env = make_atari_env(config.env_name)
     rewards = []
     episode_lengths = []
@@ -265,24 +239,30 @@ def evaluate_model(network, writer, training_step, config, device):
     print(f"Evaluation complete. Average reward: {avg_reward}, Average length: {avg_length}")
     return avg_reward, avg_length
 
-def process_observation(observation, device):
+def process_observation(observation: np.ndarray, device: torch.device) -> torch.Tensor:
     if isinstance(observation, (gym.wrappers.frame_stack.LazyFrames, np.ndarray)):
         observation_array = np.array(observation)
+    elif isinstance(observation, tuple):
+        if isinstance(observation[0], gym.wrappers.frame_stack.LazyFrames):
+            observation_array = np.array(observation[0])
+        elif isinstance(observation[0], np.ndarray):
+            observation_array = observation[0]
+        else:
+            raise ValueError(f"Unexpected observation type inside tuple: {type(observation[0])}")
     else:
         raise ValueError(f"Unexpected observation type: {type(observation)}")
 
     if observation_array.ndim == 4:  # Batched observations
-        # Assuming shape is (num_envs, channels, height, width)
         pass
     elif observation_array.ndim == 3:  # Single observation
-        # Assuming shape is (channels, height, width)
         observation_array = np.expand_dims(observation_array, axis=0)
     else:
         raise ValueError(f"Unexpected observation shape: {observation_array.shape}")
 
-    return torch.FloatTensor(observation_array).to(device, dtype=torch.bfloat16)
+    return torch.tensor(observation_array, dtype=torch.bfloat16, device=device)
 
-def log_metrics(training_step, network, replay_buffer, writer, config, optimizer):
+
+def log_metrics(training_step: int, network: MuZeroNetwork, replay_buffer: ReplayBuffer, writer: SummaryWriter, config: MuZeroConfig, optimizer: torch.optim.Optimizer):
     writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], training_step)
     writer.add_scalar('Training/ReplayBufferSize', len(replay_buffer), training_step)
 
@@ -291,26 +271,26 @@ def log_metrics(training_step, network, replay_buffer, writer, config, optimizer
         if param.grad is not None:
             writer.add_histogram(f'Gradients/{name}', param.grad.to(torch.float32), training_step)
 
-def log_losses(writer, losses, training_step):
+def log_losses(writer: SummaryWriter, losses: tuple[float, float, float, float], training_step: int):
     total_loss, value_loss, reward_loss, policy_loss = losses
     writer.add_scalar('Loss/Total', total_loss, training_step)
     writer.add_scalar('Loss/Value', value_loss, training_step)
     writer.add_scalar('Loss/Reward', reward_loss, training_step)
     writer.add_scalar('Loss/Policy', policy_loss, training_step)
 
-def log_memory_usage(writer, step):
+def log_memory_usage(writer: SummaryWriter, step: int):
     process = psutil.Process(os.getpid())
     mem = process.memory_info().rss / 1024 / 1024  # in MB
     writer.add_scalar('System/MemoryUsage', mem, step)
     print(f"Memory usage: {mem:.2f} MB")
 
-def make_atari_env(env_name):
+def make_atari_env(env_name: str):
     env = gym.make(env_name)
     env = AtariPreprocessing(env, scale_obs=True, frame_skip=1)
     env = FrameStack(env, 4)
     return env
 
-def save_checkpoint(network, optimizer, training_step, config):
+def save_checkpoint(network: MuZeroNetwork, optimizer: torch.optim.Optimizer, training_step: int, config: MuZeroConfig):
     checkpoint_path = os.path.join(config.checkpoint_dir, f'muzero_checkpoint_{training_step}.pth')
     torch.save({
         'step': training_step,
@@ -322,14 +302,14 @@ def save_checkpoint(network, optimizer, training_step, config):
 if __name__ == '__main__':
     config = MuZeroConfig()
     config.set_game('atari')
-    config.env_name = 'PongNoFrameskip-v4'
+    config.env_name = "ALE/Pong-v5"
     config.action_space_size = 6  # Pong-specific
     config.observation_shape = (4, 84, 84)  # 4 stacked frames, each 84x84
     config.support_size = 300  # This results in 601 categories (2 * 300 + 1)
     config.max_moves = 1000  # Max moves per episode
     config.discount = 0.997  # Discount factor
-    config.num_simulations = 50  # Number of future moves self-played
-    config.batch_size = 128
+    config.num_simulations = 20  # Number of future moves self-played
+    config.batch_size = 4
     config.td_steps = 10
     config.num_unroll_steps = 5
     config.pb_c_base = 19652
@@ -349,12 +329,12 @@ if __name__ == '__main__':
     config.lr_decay_steps = 350000
     config.momentum = 0.9
     config.weight_decay = 1e-4
-    config.num_channels = 128  # Number of channels in convolutional layers
-    config.num_blocks = 16  # Number of residual blocks in the representation network
+    config.num_channels = 64  # Number of channels in convolutional layers
+    config.num_blocks = 2  # Number of residual blocks in the representation network
 
-    config.encoding_size = 128
-    config.hidden_size = 256
-    config.games_per_training_step = 10  # Number of games to play before each training step
+    config.encoding_size = 64
+    config.hidden_size = 128
+    config.games_per_training_step = 16  # Number of games to play before each training step
 
     config.checkpoint_dir = './checkpoints'
     os.makedirs(config.checkpoint_dir, exist_ok=True)

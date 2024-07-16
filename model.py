@@ -1,3 +1,5 @@
+# model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +8,9 @@ import numpy as np
 from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import threading
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 class NetworkOutput:
     def __init__(self, value, reward, policy_logits, hidden_state):
@@ -18,7 +23,7 @@ class NetworkOutput:
         return support_to_scalar(self.value, self.value.shape[-1] // 2).item()
 
     def scalar_reward(self):
-        return support_to_scalar(self.reward, self.reward.shape[-1] // 2).item() if self.reward is not None else None
+        return support_to_scalar(self.reward, self.reward.shape[-1] // 2) if self.reward is not None else None
 
 class RepresentationNetwork(nn.Module):
     def __init__(self, observation_shape, num_blocks, num_channels):
@@ -28,7 +33,7 @@ class RepresentationNetwork(nn.Module):
         self.resblocks = nn.ModuleList([ResidualBlock(num_channels) for _ in range(num_blocks)])
 
     def forward(self, x):
-        x = x.to(torch.bfloat16)  # Ensure input is in BF16
+        x = x.to(device, dtype=torch.bfloat16)
         x = F.relu(self.bn1(self.conv1(x)))
         for block in self.resblocks:
             x = block(x)
@@ -41,9 +46,9 @@ class MuZeroNetwork(nn.Module):
         self.num_channels = num_channels
         self.support_size = support_size
 
-        self.representation = RepresentationNetwork(observation_shape, num_blocks, num_channels)
-        self.dynamics = DynamicsNetwork(num_channels, num_blocks, action_space_size, support_size)
-        self.prediction = PredictionNetwork(num_channels, action_space_size, support_size)
+        self.representation = RepresentationNetwork(observation_shape, num_blocks, num_channels).to(device, dtype=torch.bfloat16)
+        self.dynamics = DynamicsNetwork(num_channels, num_blocks, action_space_size, support_size).to(device, dtype=torch.bfloat16)
+        self.prediction = PredictionNetwork(num_channels, action_space_size, support_size).to(device, dtype=torch.bfloat16)
 
     def initial_inference(self, observation) -> NetworkOutput:
         hidden_state = self.representation(observation)
@@ -64,7 +69,7 @@ class PredictionNetwork(nn.Module):
         self.fc_value = nn.Linear(num_channels, 2 * support_size + 1)
 
     def forward(self, x):
-        x = x.to(torch.bfloat16)  # Ensure input is in BF16
+        x = x.to(device, dtype=torch.bfloat16)
         x = F.relu(self.bn(self.conv(x)))
         x = x.mean(dim=(2, 3))  # Global average pooling
         policy_logits = self.fc_policy(x)
@@ -81,7 +86,7 @@ class DynamicsNetwork(nn.Module):
         self.reward_head = nn.Linear(num_channels, 2 * support_size + 1)
 
     def forward(self, hidden_state, action=None):
-        hidden_state = hidden_state.to(torch.bfloat16)  # Ensure hidden state is in BF16
+        hidden_state = hidden_state.to(device, dtype=torch.bfloat16)
         batch_size = hidden_state.size(0)
         if action is not None:
             action_one_hot = torch.zeros(batch_size, self.action_space_size, hidden_state.size(2), hidden_state.size(3)).to(hidden_state.device, dtype=torch.bfloat16)
@@ -105,7 +110,7 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(num_channels)
 
     def forward(self, x):
-        x = x.to(torch.bfloat16)  # Ensure input is in BF16
+        x = x.to(device, dtype=torch.bfloat16)
         residual = x
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
@@ -188,11 +193,7 @@ class MCTS:
 
         with ThreadPoolExecutor(max_workers=self.config.num_mcts_workers) as executor:
             for _ in range(0, self.config.num_simulations, self.config.num_mcts_workers):
-                futures = []
-                for _ in range(self.config.num_mcts_workers):
-                    futures.append(executor.submit(self.run_single_simulation, root, action_space_size, network, min_max_stats))
-                
-                # Wait for all simulations in this batch to complete
+                futures = [executor.submit(self.run_single_simulation, root, action_space_size, network, min_max_stats) for _ in range(self.config.num_mcts_workers)]
                 for future in futures:
                     future.result()
 
@@ -208,21 +209,19 @@ class MCTS:
             action, node = self.select_child(node, min_max_stats)
             search_path.append(node)
 
-        # We've reached a leaf node, expand it
         parent = search_path[-1]
         with torch.no_grad():
             network_output = network.recurrent_inference(parent.hidden_state)
-        
+
         with self.lock:
             self.expand_node(parent, action_space_size, network_output)
-        
+
         value = network_output.scalar_value()
         reward = network_output.scalar_reward()
         self.backpropagate(search_path, value, reward if reward is not None else 0, min_max_stats)
 
     def select_child(self, node: Node, min_max_stats: MinMaxStats) -> Tuple[int, Node]:
-        _, action, child = max((self.ucb_score(node, child, min_max_stats), action, child)
-                                for action, child in node.children.items())
+        _, action, child = max((self.ucb_score(node, child, min_max_stats), action, child) for action, child in node.children.items())
         return action, child
 
     def ucb_score(self, parent: Node, child: Node, min_max_stats: MinMaxStats) -> float:
@@ -235,11 +234,12 @@ class MCTS:
 
     def expand_node(self, node: Node, action_space_size: int, network_output: NetworkOutput):
         node.hidden_state = network_output.hidden_state
-        node.reward = network_output.scalar_reward() if network_output.reward is not None else 0.0
-        policy_logits = network_output.policy_logits.to(torch.float32)  # Convert to float32 for softmax
-        policy = torch.softmax(policy_logits, dim=1).squeeze(0).detach().cpu().numpy()
-        for action in range(action_space_size):
-            node.children[action] = Node(prior=policy[action], hidden_state=network_output.hidden_state)
+        rewards = network_output.scalar_reward()
+        if rewards is not None:
+            for i, reward in enumerate(rewards):
+                child_node = Node(prior=0, hidden_state=network_output.hidden_state)
+                child_node.reward = reward.item()  # Convert the reward tensor to a scalar value
+                node.children[i] = child_node
 
     def backpropagate(self, search_path: List[Node], value: float, reward: float, min_max_stats: MinMaxStats):
         for node in reversed(search_path):
@@ -249,16 +249,15 @@ class MCTS:
             value = node.reward + self.config.discount * value
 
 def support_to_scalar(logits, support_size):
-    """Transform a categorical representation to a scalar"""
     probabilities = torch.softmax(logits, dim=-1)
     support = torch.arange(-support_size, support_size + 1).to(logits.device, dtype=torch.bfloat16)
     x = torch.sum(support * probabilities, dim=-1)
-    return x.item()  # Return a scalar value
+    return x.item()
 
 def select_action(config, root: Node, temperature: float) -> int:
     if not root.children:
         return np.random.randint(config.action_space_size)
-    
+
     visit_counts = [child.visit_count for child in root.children.values()]
     actions = [action for action in root.children.keys()]
     if temperature == 0:
@@ -266,17 +265,13 @@ def select_action(config, root: Node, temperature: float) -> int:
     elif temperature == float('inf'):
         action = np.random.choice(actions)
     else:
-        # See paper appendix Data Generation
         visit_count_distribution = np.array(visit_counts) ** (1 / temperature)
         visit_count_distribution = visit_count_distribution / sum(visit_count_distribution)
         action = np.random.choice(actions, p=visit_count_distribution)
-    
+
     return action
 
 def scalar_to_support(x, support_size):
-    """
-    Transform a scalar to a categorical representation with (2 * support_size + 1) categories
-    """
     x = torch.clamp(x, -support_size, support_size)
     floor = x.floor()
     prob = x - floor
@@ -289,9 +284,6 @@ def scalar_to_support(x, support_size):
     return logits
 
 def support_to_scalar(logits, support_size):
-    """
-    Transform a categorical representation to a scalar
-    """
     probabilities = torch.softmax(logits, dim=-1)
     support = torch.arange(-support_size, support_size + 1).to(logits.device, dtype=torch.bfloat16)
     x = torch.sum(support * probabilities, dim=-1)
@@ -302,13 +294,11 @@ def update_weights(optimizer: torch.optim.Optimizer, network: MuZeroNetwork, bat
     value_loss, reward_loss, policy_loss = 0, 0, 0
 
     for image, actions, targets in batch:
-        image = image.to(torch.bfloat16)  # Ensure input is in BF16
-        # Initial step
+        image = image.to(device, dtype=torch.bfloat16)
         network_output = network.initial_inference(image)
         hidden_state = network_output.hidden_state
         predictions = [(1.0, network_output)]
 
-        # Recurrent steps
         for action in actions:
             network_output = network.recurrent_inference(hidden_state, action)
             hidden_state = network_output.hidden_state
@@ -342,38 +332,29 @@ def update_weights(optimizer: torch.optim.Optimizer, network: MuZeroNetwork, bat
     return (loss.item(), value_loss.item(), reward_loss.item(), policy_loss.item())
 
 def scalar_to_support_loss(logits, scalar, support_size):
-    """
-    Transform a scalar to a categorical representation and compute cross-entropy with the logits
-    """
     scalar_support = scalar_to_support(scalar.unsqueeze(-1), support_size).squeeze(-1)
     return F.cross_entropy(logits, torch.argmax(scalar_support, dim=1))
 
 class MuZeroConfig:
     def __init__(self):
-        # Game
         self.action_space_size = None
         self.num_players = None
 
-        # Network
         self.observation_shape = None
         self.support_size = 300
         self.num_blocks = 6
         self.num_channels = 128
 
-        # Self-Play
         self.num_actors = 1
         self.max_moves = 512
         self.num_simulations = 20
 
-        # Root prior exploration noise
         self.root_dirichlet_alpha = 0.3
         self.root_exploration_fraction = 0.25
 
-        # UCB formula
         self.pb_c_base = 19652
         self.pb_c_init = 1.25
 
-        # Training
         self.training_steps = int(1000e3)
         self.checkpoint_interval = int(1e3)
         self.batch_size = 1024
@@ -381,27 +362,22 @@ class MuZeroConfig:
         self.td_steps = 10
         self.num_mcts_workers = 16
 
-        # Replay Buffer
         self.replay_buffer_size = int(1e6)
         self.num_workers = 4
 
-        # Optimization
         self.weight_decay = 1e-4
         self.momentum = 0.9
         self.lr_init = 0.05
 
-        # Exponential learning rate schedule
         self.lr_decay_rate = 0.1
         self.lr_decay_steps = 350e3
 
-        # Evaluation
         self.discount = 0.997
         self.value_loss_weight = 0.25
         self.reward_loss_weight = 1.0
         self.policy_loss_weight = 1.0
         self.max_grad_norm = 5
 
-        # Environment
         self.num_envs = 8
 
     def visit_softmax_temperature_fn(self, trained_steps):
@@ -414,8 +390,8 @@ class MuZeroConfig:
 
     def set_game(self, env_name):
         if env_name == 'atari':
-            self.action_space_size = 6  # This is correct for Pong
+            self.action_space_size = 6
             self.num_players = 1
-            self.observation_shape = (4, 84, 84)  # 4 stacked frames, each 84x84
+            self.observation_shape = (4, 84, 84)
         else:
             raise ValueError(f"Unknown game: {env_name}")

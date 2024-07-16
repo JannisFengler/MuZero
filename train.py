@@ -1,3 +1,5 @@
+# train.py
+
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
@@ -85,57 +87,52 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-def play_game(config, network, device):
-    game = GameHistory(config)
-    env = make_atari_env(config.env_name)
-    observation = env.reset()
-    game.observation_history.append(observation)
-    done = False
+def play_games(config, network, device, num_games):
+    envs = gym.vector.AsyncVectorEnv([lambda: make_atari_env(config.env_name) for _ in range(num_games)])
+    observations, infos = envs.reset()
+    print(f"Initial observations: {observations}")
+    print(f"Initial infos: {infos}")
 
-    print("Starting new game")
-    step = 0
-    while not done and step < config.max_moves:
-        step += 1
-        
-        observation_tensor = process_observation(observation, device)
+    games = [GameHistory(config) for _ in range(num_games)]
+    for i, game in enumerate(games):
+        game.observation_history.append(observations[i])  # Store individual observations
 
-        with torch.no_grad():
-            initial_inference = network.initial_inference(observation_tensor.to(torch.bfloat16))
+    dones = [False] * num_games
+    steps = 0
 
-        root = Node(prior=0, hidden_state=initial_inference.hidden_state)
+    while not all(dones) and steps < config.max_moves:
+        steps += 1
+        actions = []
+        for i, game in enumerate(games):
+            if not dones[i]:
+                observation_tensor = process_observation(game.observation_history[-1], device)  # Process individual observation
+                with torch.no_grad():
+                    initial_inference = network.initial_inference(observation_tensor)
+                root = Node(prior=0, hidden_state=initial_inference.hidden_state)
+                mcts = MCTS(config)
+                mcts.run(root, config.action_space_size, network, MinMaxStats())
+                game.store_search_statistics(root, config.action_space_size)
+                actions.append(select_action(config, root, steps))
+            else:
+                actions.append(0)  # Placeholder action for finished games
 
-        mcts = MCTS(config)
-        mcts.run(root, config.action_space_size, network, MinMaxStats())
+        actions = np.array(actions)
+        results = envs.step(actions)
+        observations, rewards, dones = results[0], results[1], results[2]
+        print(f"Step {steps}: observations: {observations}, rewards: {rewards}, dones: {dones}")
 
-        game.store_search_statistics(root, config.action_space_size)
+        for i, game in enumerate(games):
+            if not dones[i]:
+                game.observation_history.append(observations[i])  # Store individual observations
+                game.action_history.append(actions[i])
+                game.reward_history.append(rewards[i])
+                game.to_play_history.append(1)
 
-        action = select_action(config, root, step)
+    for game in games:
+        print(f"Game completed. Game length: {len(game.action_history)}, Total reward: {sum(game.reward_history)}")
 
-        try:
-            next_observation, reward, done, info = env.step(action)
-        except ValueError:
-            next_observation, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-
-        game.observation_history.append(next_observation)
-        game.action_history.append(action)
-        game.reward_history.append(reward)
-        game.to_play_history.append(1)  # Assuming single-player game
-
-        observation = next_observation
-
-    print(f"Game completed. Game length: {step}, Total reward: {sum(game.reward_history)}")
-    
-    return game
-
-def play_multiple_games(config, network, device, num_games):
-    games = []
-    for game_id in range(num_games):
-        print(f"Starting game {game_id + 1}/{num_games}")
-        game = play_game(config, network, device)
-        games.append(game)
-        print(f"Game {game_id + 1} completed. Total reward: {sum(game.reward_history)}, Length: {len(game.action_history)}")
     return games
+
 
 def train_muzero(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,18 +145,18 @@ def train_muzero(config):
         config.num_channels,
         config.support_size
     ).to(device, dtype=torch.bfloat16)
-    
+
     optimizer = optim.SGD(
         network.parameters(),
         lr=config.lr_init,
         momentum=config.momentum,
         weight_decay=config.weight_decay
     )
-    
+
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=config.lr_decay_rate)
-    
+
     replay_buffer = ReplayBuffer(config)
-    
+
     log_dir = os.path.join('runs', datetime.now().strftime('%Y%m%d-%H%M%S'))
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logs will be written to: {log_dir}")
@@ -169,11 +166,10 @@ def train_muzero(config):
 
     for training_step in range(config.training_steps):
         print(f"Starting training step {training_step}")
-        
-        # Self-play
+
         if len(replay_buffer) < config.batch_size * config.games_per_training_step:
             print(f"Starting self-play at step {training_step}")
-            games = play_multiple_games(config, network, device, config.games_per_training_step)
+            games = play_games(config, network, device, config.games_per_training_step)
             for game in games:
                 replay_buffer.save_game(game)
                 total_games += 1
@@ -183,41 +179,37 @@ def train_muzero(config):
             writer.add_scalar('Training/TotalGames', total_games, training_step)
             writer.add_scalar('Training/TotalGameSteps', total_steps, training_step)
             print(f"Finished self-play. Replay buffer size: {len(replay_buffer)}")
+            del games
+            gc.collect()
 
-        # Training
         if len(replay_buffer) >= config.batch_size:
             print(f"Sampling batch from replay buffer. Buffer size: {len(replay_buffer)}")
             batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
             losses = update_weights(optimizer, network, batch, config)
             log_losses(writer, losses, training_step)
-            print(f"Updated weights. Losses: {losses}")
-
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
-            writer.add_scalar('Training/LearningRate', current_lr, training_step)
-            print(f"Updated learning rate. Current LR: {current_lr}")
+            if training_step % config.log_interval == 0:
+                writer.add_scalar('Training/LearningRate', current_lr, training_step)
+            print(f"Updated weights. Losses: {losses}, Current LR: {current_lr}")
 
-        # Logging
         if training_step % config.log_interval == 0:
             log_metrics(training_step, network, replay_buffer, writer, config, optimizer)
             log_memory_usage(writer, training_step)
             print(f"Logged metrics at step {training_step}")
 
-        # Evaluation
         if training_step % config.eval_interval == 0:
             print(f"Starting evaluation at step {training_step}")
             avg_reward, avg_length = evaluate_model(network, writer, training_step, config, device)
             print(f"Evaluation complete. Average reward: {avg_reward}, Average length: {avg_length}")
 
-        # Save network
         if training_step % config.checkpoint_interval == 0:
             save_checkpoint(network, optimizer, training_step, config)
             print(f"Saved checkpoint at step {training_step}")
 
         print(f"Completed training step {training_step}")
-        writer.flush()  # Ensure all events are written to disk
+        writer.flush()
 
-        # Force garbage collection every 10 steps
         if training_step % 10 == 0:
             gc.collect()
 
@@ -242,14 +234,14 @@ def evaluate_model(network, writer, training_step, config, device):
             observation_tensor = process_observation(observation, device)
             
             with torch.no_grad():
-                initial_inference = network.initial_inference(observation_tensor.to(torch.bfloat16))
+                initial_inference = network.initial_inference(observation_tensor)
             
             root = Node(prior=0, hidden_state=initial_inference.hidden_state)
             
             mcts = MCTS(config)
             mcts.run(root, config.action_space_size, network, MinMaxStats())
             
-            action = select_action(config, root, temperature=0)  # Greedy action for evaluation
+            action = select_action(config, root, temperature=0)
             
             try:
                 observation, reward, done, _ = env.step(action)
@@ -259,43 +251,36 @@ def evaluate_model(network, writer, training_step, config, device):
             
             reward_sum += reward
 
-            if step % 100 == 0:
-                print(f"Evaluation episode {episode + 1}, step {step}, current reward: {reward_sum}")
-
         rewards.append(reward_sum)
         episode_lengths.append(step)
         print(f"Evaluation episode {episode + 1} completed. Total reward: {reward_sum}, Length: {step}")
 
-    avg_reward = sum(rewards) / len(rewards)
-    avg_length = sum(episode_lengths) / len(episode_lengths)
-    
+    avg_reward = np.mean(rewards)
+    avg_length = np.mean(episode_lengths)
     writer.add_scalar('Evaluation/AverageReward', avg_reward, training_step)
     writer.add_scalar('Evaluation/AverageEpisodeLength', avg_length, training_step)
     writer.add_histogram('Evaluation/EpisodeRewards', np.array(rewards), training_step)
     writer.add_histogram('Evaluation/EpisodeLengths', np.array(episode_lengths), training_step)
-    
+
     print(f"Evaluation complete. Average reward: {avg_reward}, Average length: {avg_length}")
     return avg_reward, avg_length
 
 def process_observation(observation, device):
-    if isinstance(observation, gym.wrappers.frame_stack.LazyFrames):
+    if isinstance(observation, (gym.wrappers.frame_stack.LazyFrames, np.ndarray)):
         observation_array = np.array(observation)
-    elif isinstance(observation, np.ndarray):
-        observation_array = observation
-    elif isinstance(observation, tuple) and isinstance(observation[0], gym.wrappers.frame_stack.LazyFrames):
-        observation_array = np.array(observation[0])
     else:
         raise ValueError(f"Unexpected observation type: {type(observation)}")
-    
-    if len(observation_array.shape) == 3:
-        if observation_array.shape[-1] == 3 or observation_array.shape[-1] == 4:
-            observation_array = np.transpose(observation_array, (2, 0, 1))
-    elif len(observation_array.shape) == 4:
+
+    if observation_array.ndim == 4:  # Batched observations
+        # Assuming shape is (num_envs, channels, height, width)
         pass
+    elif observation_array.ndim == 3:  # Single observation
+        # Assuming shape is (channels, height, width)
+        observation_array = np.expand_dims(observation_array, axis=0)
     else:
         raise ValueError(f"Unexpected observation shape: {observation_array.shape}")
-    
-    return torch.FloatTensor(observation_array).unsqueeze(0).to(device, dtype=torch.bfloat16)
+
+    return torch.FloatTensor(observation_array).to(device, dtype=torch.bfloat16)
 
 def log_metrics(training_step, network, replay_buffer, writer, config, optimizer):
     writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], training_step)
@@ -305,7 +290,6 @@ def log_metrics(training_step, network, replay_buffer, writer, config, optimizer
         writer.add_histogram(f'Parameters/{name}', param.to(torch.float32), training_step)
         if param.grad is not None:
             writer.add_histogram(f'Gradients/{name}', param.grad.to(torch.float32), training_step)
-
 
 def log_losses(writer, losses, training_step):
     total_loss, value_loss, reward_loss, policy_loss = losses
@@ -368,12 +352,11 @@ if __name__ == '__main__':
     config.num_channels = 128  # Number of channels in convolutional layers
     config.num_blocks = 16  # Number of residual blocks in the representation network
 
-    # Network architecture (you may need to adjust these based on your MuZeroNetwork implementation)
     config.encoding_size = 128
     config.hidden_size = 256
     config.games_per_training_step = 10  # Number of games to play before each training step
-    
+
     config.checkpoint_dir = './checkpoints'
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-    
+
     train_muzero(config)

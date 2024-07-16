@@ -100,8 +100,8 @@ def play_game(config, network, device):
         observation_tensor = process_observation(observation, device)
 
         with torch.no_grad():
-            initial_inference = network.initial_inference(observation_tensor)
-        
+            initial_inference = network.initial_inference(observation_tensor.to(torch.bfloat16))
+
         root = Node(prior=0, hidden_state=initial_inference.hidden_state)
 
         mcts = MCTS(config)
@@ -147,7 +147,7 @@ def train_muzero(config):
         config.num_blocks,
         config.num_channels,
         config.support_size
-    ).to(device)
+    ).to(device, dtype=torch.bfloat16)
     
     optimizer = optim.SGD(
         network.parameters(),
@@ -242,7 +242,7 @@ def evaluate_model(network, writer, training_step, config, device):
             observation_tensor = process_observation(observation, device)
             
             with torch.no_grad():
-                initial_inference = network.initial_inference(observation_tensor)
+                initial_inference = network.initial_inference(observation_tensor.to(torch.bfloat16))
             
             root = Node(prior=0, hidden_state=initial_inference.hidden_state)
             
@@ -295,16 +295,17 @@ def process_observation(observation, device):
     else:
         raise ValueError(f"Unexpected observation shape: {observation_array.shape}")
     
-    return torch.FloatTensor(observation_array).unsqueeze(0).to(device)
+    return torch.FloatTensor(observation_array).unsqueeze(0).to(device, dtype=torch.bfloat16)
 
 def log_metrics(training_step, network, replay_buffer, writer, config, optimizer):
     writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], training_step)
     writer.add_scalar('Training/ReplayBufferSize', len(replay_buffer), training_step)
 
     for name, param in network.named_parameters():
-        writer.add_histogram(f'Parameters/{name}', param, training_step)
+        writer.add_histogram(f'Parameters/{name}', param.to(torch.float32), training_step)
         if param.grad is not None:
-            writer.add_histogram(f'Gradients/{name}', param.grad, training_step)
+            writer.add_histogram(f'Gradients/{name}', param.grad.to(torch.float32), training_step)
+
 
 def log_losses(writer, losses, training_step):
     total_loss, value_loss, reward_loss, policy_loss = losses

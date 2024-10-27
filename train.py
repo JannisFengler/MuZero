@@ -1,21 +1,16 @@
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from model import (MuZeroNetwork, MCTS, select_action, MinMaxStats, Node, 
-                  ReplayBuffer, MuZeroConfig, transform_value, NetworkOutput)
+from model import (MuZeroNetwork, MCTS, select_action, MinMaxStats, Node,
+                   ReplayBuffer, MuZeroConfig, transform_value, scalar_to_support_loss)
 import gym
-from gym.wrappers import AtariPreprocessing, FrameStack
+from gym.wrappers import AtariPreprocessing, FrameStack, ResizeObservation
 import numpy as np
-from collections import deque
-import time
 import os
 from datetime import datetime
-import gc
-import psutil
-from typing import List, Tuple, Dict, Optional
 import logging
-import json
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Tuple, Dict, Optional
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -45,32 +40,30 @@ class Game:
         targets = []
 
         for current_index in range(state_index, state_index + num_unroll_steps + 1):
-            bootstrap_index = current_index + td_steps
-
-            if bootstrap_index < len(self.values):
-                value = self.compute_target_value(current_index, bootstrap_index)
-            else:
-                value = 0
-
+            value = self.compute_target_value(current_index, td_steps)
             if current_index < len(self.rewards):
-                targets.append((
-                    value,
-                    self.rewards[current_index],
-                    self.policies[current_index]
-                ))
+                reward = self.rewards[current_index]
+                policy = self.policies[current_index]
             else:
-                # States past the end of games are treated as absorbing states
-                targets.append((0, 0, np.zeros(self.action_space_size)))
+                reward = 0
+                policy = np.zeros(self.action_space_size)
+            targets.append((value, reward, policy))
 
         return targets
 
-    def compute_target_value(self, state_index: int, bootstrap_index: int) -> float:
+    def compute_target_value(self, state_index: int, td_steps: int) -> float:
         """Compute n-step target value."""
-        value = self.values[bootstrap_index] * self.discount ** (bootstrap_index - state_index)
-
-        for i, reward in enumerate(self.rewards[state_index:bootstrap_index]):
-            value += reward * self.discount ** i
-
+        value = 0.0
+        discount = 1.0
+        for i in range(td_steps):
+            idx = state_index + i
+            if idx < len(self.rewards):
+                value += self.rewards[idx] * discount
+                discount *= self.discount
+            else:
+                break
+        if state_index + td_steps < len(self.values):
+            value += self.values[state_index + td_steps] * discount
         return value
 
     def store_transition(self, action: int, observation: np.ndarray, reward: float):
@@ -79,6 +72,10 @@ class Game:
         self.observations.append(observation)
         self.rewards.append(reward)
         self.environment_steps += 1
+
+    def get_observation(self, index: int) -> np.ndarray:
+        """Retrieve the observation at a given index."""
+        return self.observations[index]
 
 class MuZeroTrainer:
     """Main training class for MuZero."""
@@ -133,7 +130,8 @@ class MuZeroTrainer:
                 if len(self.replay_buffer) >= self.config.minimum_games_in_buffer:
                     self.training_step += 1
                     self.update_weights()
-                    self.save_checkpoint()
+                    if self.training_step % self.config.checkpoint_interval == 0:
+                        self.save_checkpoint()
 
                 # Evaluation
                 if self.training_step % self.config.eval_interval == 0:
@@ -166,23 +164,25 @@ class MuZeroTrainer:
         game = Game(self.config.action_space_size, self.config.discount)
 
         observation = env.reset()
-        game.observations.append(observation)
+        game.store_transition(None, observation, 0)  # Initial transition with no action
 
         done = False
         while not done and len(game.actions) < self.config.max_moves:
+            # Prepare history
+            history = game.actions[-32:]  # Last 32 actions
+            observation_tensor = self.prepare_observation(observation, history)
+
             # MCTS
             root = Node(0, None)
-            observation_tensor = self.prepare_observation(observation)
 
             with torch.no_grad():
                 network_output = self.network.initial_inference(observation_tensor)
                 root.expand(range(self.config.action_space_size), network_output)
 
-            if len(game.actions) < self.config.num_simulations:
-                root.add_exploration_noise(
-                    dirichlet_alpha=self.config.root_dirichlet_alpha,
-                    exploration_fraction=self.config.root_exploration_fraction
-                )
+            root.add_exploration_noise(
+                dirichlet_alpha=self.config.root_dirichlet_alpha,
+                exploration_fraction=self.config.root_exploration_fraction
+            )
 
             # Run MCTS
             mcts = MCTS(self.config)
@@ -227,80 +227,89 @@ class MuZeroTrainer:
         self.replay_buffer.update_priorities(indices, priorities)
 
         # Log metrics
-        self.log_training_metrics(value_loss.mean(), reward_loss.mean(), policy_loss.mean(), total_loss_scalar)
+        self.log_training_metrics(value_loss.item(), reward_loss.item(), policy_loss.item(), total_loss_scalar.item())
 
     def compute_losses(self, batch, weights) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute training losses."""
-        observations, actions, targets = zip(*batch)
-        observations_tensor = torch.stack([self.prepare_observation(obs) for obs in observations])
+        observations, actions_list, targets_list = zip(*batch)
+        batch_size = len(observations)
+
+        # Prepare tensors
+        observations_tensor = torch.stack([self.prepare_observation(obs, []) for obs in observations]).to(device)
+        weights = torch.tensor(weights, device=device, dtype=torch.float32)
 
         # Initial inference
         network_output = self.network.initial_inference(observations_tensor)
 
-        # Value loss
-        target_values = torch.tensor([target[0] for target in targets], device=device)
-        value_loss = self.scalar_to_support_loss(
-            network_output.value.squeeze(-1),
-            target_values
-        )  # Per-sample loss
+        # Initialize accumulators
+        total_value_loss = 0
+        total_reward_loss = 0
+        total_policy_loss = 0
+        total_loss_per_sample = 0
 
-        # Policy loss
-        target_policies = torch.tensor([target[2] for target in targets], device=device)
-        policy_loss = -(
-            torch.log_softmax(network_output.policy_logits, dim=1) *
-            target_policies
-        ).sum(1)  # Per-sample loss
-
-        # Recurrent inferences
-        reward_loss = torch.zeros(len(batch), device=device)  # Initialize per-sample reward_loss
-
+        # Unroll the dynamics
         hidden_state = network_output.hidden_state
-        for unroll_step in range(self.config.num_unroll_steps):
-            actions_tensor = torch.tensor(
-                [actions[b][unroll_step] for b in range(len(actions))],
-                device=device
-            ).unsqueeze(-1)  # Shape (batch_size, 1)
+        for t in range(self.config.num_unroll_steps + 1):
+            target_values = []
+            target_rewards = []
+            target_policies = []
+            actions = []
+            for i in range(batch_size):
+                if t < len(targets_list[i]):
+                    target_values.append(targets_list[i][t][0])
+                    target_rewards.append(targets_list[i][t][1])
+                    target_policies.append(targets_list[i][t][2])
+                else:
+                    target_values.append(0)
+                    target_rewards.append(0)
+                    target_policies.append(np.zeros(self.config.action_space_size))
+                if t > 0 and t - 1 < len(actions_list[i]):
+                    actions.append(actions_list[i][t - 1])
+                else:
+                    actions.append(0)  # Dummy action
 
-            network_output = self.network.recurrent_inference(hidden_state, actions_tensor)
-            hidden_state = network_output.hidden_state
+            target_values = torch.tensor(target_values, device=device, dtype=torch.float32)
+            target_rewards = torch.tensor(target_rewards, device=device, dtype=torch.float32)
+            target_policies = torch.tensor(target_policies, device=device, dtype=torch.float32)
+            actions_tensor = torch.tensor(actions, device=device, dtype=torch.long).unsqueeze(-1)
 
-            # Reward loss
-            target_rewards = torch.tensor(
-                [targets[b][unroll_step + 1][1] if unroll_step + 1 < len(targets[b]) else 0 for b in range(len(targets))],
-                device=device
+            # Value loss
+            value_loss = scalar_to_support_loss(network_output.value.squeeze(-1), target_values, self.config.support_size)
+            total_value_loss += value_loss
+
+            # Policy loss
+            policy_loss = -(torch.log_softmax(network_output.policy_logits, dim=1) * target_policies).sum(1)
+            total_policy_loss += policy_loss
+
+            if t > 0:
+                # Reward loss
+                reward_loss = scalar_to_support_loss(network_output.reward.squeeze(-1), target_rewards, self.config.support_size)
+                total_reward_loss += reward_loss
+            else:
+                reward_loss = torch.zeros(batch_size, device=device)
+
+            # Total loss per sample
+            total_loss = (
+                self.config.value_loss_weight * value_loss +
+                self.config.reward_loss_weight * reward_loss +
+                self.config.policy_loss_weight * policy_loss
             )
+            total_loss_per_sample += total_loss * weights
 
-            step_reward_loss = self.scalar_to_support_loss(
-                network_output.reward.squeeze(-1),
-                target_rewards
-            )  # Per-sample loss
-
-            reward_loss += step_reward_loss
-
-        # Apply weights
-        value_loss = value_loss * weights
-        reward_loss = reward_loss * weights
-        policy_loss = policy_loss * weights
+            # Recurrent inference
+            if t < self.config.num_unroll_steps:
+                network_output = self.network.recurrent_inference(hidden_state, actions_tensor)
+                hidden_state = network_output.hidden_state
 
         # Mean over batch
-        value_loss_scalar = value_loss.mean()
-        reward_loss_scalar = reward_loss.mean()
-        policy_loss_scalar = policy_loss.mean()
+        total_loss_per_sample = total_loss_per_sample / (self.config.num_unroll_steps + 1)
 
-        total_loss_per_sample = (
-            self.config.value_loss_weight * value_loss +
-            self.config.reward_loss_weight * reward_loss +
-            self.config.policy_loss_weight * policy_loss
-        )
+        # Scale losses
+        total_value_loss = (total_value_loss / (self.config.num_unroll_steps + 1)).mean()
+        total_reward_loss = (total_reward_loss / self.config.num_unroll_steps).mean()
+        total_policy_loss = (total_policy_loss / (self.config.num_unroll_steps + 1)).mean()
 
-        total_loss_scalar = total_loss_per_sample.mean()
-
-        return (
-            value_loss_scalar,
-            reward_loss_scalar,
-            policy_loss_scalar,
-            total_loss_per_sample
-        )
+        return total_value_loss, total_reward_loss, total_policy_loss, total_loss_per_sample
 
     def evaluate(self):
         """Evaluate current network."""
@@ -314,7 +323,7 @@ class MuZeroTrainer:
             total_reward = 0
 
             while not done:
-                observation_tensor = self.prepare_observation(observation)
+                observation_tensor = self.prepare_observation(observation, [])
 
                 with torch.no_grad():
                     network_output = self.network.initial_inference(observation_tensor)
@@ -322,11 +331,12 @@ class MuZeroTrainer:
                     root.expand(range(self.config.action_space_size), network_output)
 
                     mcts = MCTS(self.config)
+                    min_max_stats = MinMaxStats()
                     action_probs = mcts.run(
                         root,
                         self.config.action_space_size,
                         self.network,
-                        MinMaxStats()
+                        min_max_stats
                     )
 
                     action = select_action(self.config, root, temperature=0)
@@ -340,21 +350,20 @@ class MuZeroTrainer:
 
     def save_checkpoint(self, is_final: bool = False):
         """Save network checkpoint."""
-        if self.training_step % self.config.checkpoint_interval == 0 or is_final:
-            checkpoint = {
-                'training_step': self.training_step,
-                'model_state_dict': self.network.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'config': self.config.__dict__
-            }
+        checkpoint = {
+            'training_step': self.training_step,
+            'model_state_dict': self.network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'config': self.config.__dict__
+        }
 
-            path = os.path.join(
-                self.checkpoint_dir,
-                f'checkpoint_{self.training_step}.pt' if not is_final else 'final_checkpoint.pt'
-            )
-            torch.save(checkpoint, path)
-            logging.info(f"Saved checkpoint to {path}")
+        path = os.path.join(
+            self.checkpoint_dir,
+            f'checkpoint_{self.training_step}.pt' if not is_final else 'final_checkpoint.pt'
+        )
+        torch.save(checkpoint, path)
+        logging.info(f"Saved checkpoint to {path}")
 
     def make_env(self):
         """Create environment with proper wrappers."""
@@ -362,23 +371,40 @@ class MuZeroTrainer:
         env = AtariPreprocessing(
             env,
             frame_skip=1,
-            grayscale_obs=True,
-            scale_obs=True,
-            terminal_on_life_loss=True
+            grayscale_obs=False,  # Use RGB frames
+            scale_obs=False,
+            terminal_on_life_loss=False  # Depending on your preference
         )
-        env = FrameStack(env, num_stack=4)
+        env = ResizeObservation(env, (96, 96))
+        env = FrameStack(env, num_stack=32)
         return env
 
-    def prepare_observation(self, observation: np.ndarray) -> torch.Tensor:
-        """Prepare observation for network input."""
+    def prepare_observation(self, observation: np.ndarray, actions: List[int]) -> torch.Tensor:
+        """Prepare observation and action planes for network input."""
         if isinstance(observation, (gym.wrappers.frame_stack.LazyFrames, np.ndarray)):
             observation = np.array(observation)
         observation = np.transpose(observation, (2, 0, 1))  # CHW format
+
+        # Normalize observation to [0, 1]
+        observation = observation / 255.0
+
+        # Encode actions as planes
+        action_planes = np.zeros((self.config.action_space_size, *observation.shape[1:]), dtype=np.float32)
+        for i, action in enumerate(actions[-32:]):
+            action_planes[action] = 1.0  # Set action plane to 1
+
+        # Concatenate observation and action planes
+        observation = np.concatenate([observation, action_planes], axis=0)
         return torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
 
     def compute_priorities(self, game: Game) -> np.ndarray:
         """Compute priorities for replay buffer."""
-        return np.array([abs(value) + 1e-6 for value in game.values])
+        priorities = []
+        for i in range(len(game.values)):
+            target_value = game.compute_target_value(i, self.config.td_steps)
+            priority = abs(game.values[i] - target_value) + 1e-6
+            priorities.append(priority)
+        return np.array(priorities)
 
     def log_self_play_metrics(self, games: List[Game]):
         """Log self-play metrics to TensorBoard."""
@@ -390,13 +416,13 @@ class MuZeroTrainer:
         self.writer.add_scalar('SelfPlay/GamesPlayed', self.num_played_games, self.training_step)
         self.writer.add_scalar('SelfPlay/TotalSteps', self.num_played_steps, self.training_step)
 
-    def log_training_metrics(self, value_loss: torch.Tensor, reward_loss: torch.Tensor,
-                             policy_loss: torch.Tensor, total_loss: torch.Tensor):
+    def log_training_metrics(self, value_loss: float, reward_loss: float,
+                             policy_loss: float, total_loss: float):
         """Log training metrics to TensorBoard."""
-        self.writer.add_scalar('Loss/Value', value_loss.item(), self.training_step)
-        self.writer.add_scalar('Loss/Reward', reward_loss.item(), self.training_step)
-        self.writer.add_scalar('Loss/Policy', policy_loss.item(), self.training_step)
-        self.writer.add_scalar('Loss/Total', total_loss.item(), self.training_step)
+        self.writer.add_scalar('Loss/Value', value_loss, self.training_step)
+        self.writer.add_scalar('Loss/Reward', reward_loss, self.training_step)
+        self.writer.add_scalar('Loss/Policy', policy_loss, self.training_step)
+        self.writer.add_scalar('Loss/Total', total_loss, self.training_step)
         self.writer.add_scalar('Training/LearningRate', self.optimizer.param_groups[0]['lr'], self.training_step)
         self.writer.add_scalar('Training/ReplayBufferSize', len(self.replay_buffer), self.training_step)
 
@@ -407,23 +433,12 @@ class MuZeroTrainer:
         self.writer.add_histogram('Eval/Rewards', np.array(rewards), self.training_step)
         logging.info(f"Evaluation complete. Average reward: {avg_reward:.2f}")
 
-    def scalar_to_support_loss(self, logits: torch.Tensor, scalar: torch.Tensor) -> torch.Tensor:
-        """Convert scalar targets to categorical and compute cross-entropy loss."""
-        scalar = transform_value(scalar)  # Apply value transformation
-        targets = self.scalar_to_categorical(scalar, self.config.support_size)
-        return torch.nn.functional.cross_entropy(logits, targets, reduction='none')
-
-    def scalar_to_categorical(self, x: torch.Tensor, support_size: int) -> torch.Tensor:
-        """Transform scalar to categorical representation."""
-        x = torch.clamp(x, -support_size, support_size)
-        floor = x.floor()
-        prob = x - floor
-        logits = torch.zeros(x.shape[0], 2 * support_size + 1, device=x.device)
-        index = floor + support_size
-        index = index.long()
-        logits.scatter_(1, index.unsqueeze(-1), 1 - prob.unsqueeze(-1))
-        logits.scatter_(1, (index + 1).unsqueeze(-1), prob.unsqueeze(-1))
-        return logits
+def scalar_to_support_loss(logits: torch.Tensor, targets: torch.Tensor, support_size: int) -> torch.Tensor:
+    """Compute cross-entropy loss with soft targets."""
+    target_support = scalar_to_support(targets, support_size)
+    log_probs = F.log_softmax(logits, dim=1)
+    loss = -(target_support * log_probs).sum(1)
+    return loss
 
 def create_default_config() -> MuZeroConfig:
     """Create default configuration for training."""
@@ -431,8 +446,8 @@ def create_default_config() -> MuZeroConfig:
 
     # Environment
     config.env_name = "ALE/Pong-v5"
-    config.action_space_size = 6  # Pong-specific
-    config.observation_shape = (4, 84, 84)  # 4 stacked frames
+    config.action_space_size = gym.make(config.env_name).action_space.n
+    config.observation_shape = (32 * 3 + config.action_space_size, 96, 96)  # 32 RGB frames + action planes
 
     # Network
     config.support_size = 300  # Results in 601 categorical bins
@@ -460,7 +475,7 @@ def create_default_config() -> MuZeroConfig:
     config.lr_decay_steps = int(350e3)
     config.momentum = 0.9
     config.weight_decay = 1e-4
-    config.max_grad_norm = 10.0  # Added this
+    config.max_grad_norm = 10.0  # Gradient clipping
 
     # Loss weights
     config.value_loss_weight = 0.25
@@ -478,9 +493,6 @@ def create_default_config() -> MuZeroConfig:
     config.eval_interval = 1000
     config.eval_episodes = 32
     config.checkpoint_interval = 1000
-
-    # Visit softmax temperature function
-    config.visit_softmax_temperature_fn = lambda training_step: 1.0
 
     return config
 
@@ -521,96 +533,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# Helper functions for debugging and visualization
-
-def visualize_game(game: Game, save_dir: str = 'game_visualizations'):
-    """Visualize and save game states and statistics."""
-    import matplotlib.pyplot as plt
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Plot rewards
-    plt.figure(figsize=(10, 5))
-    plt.plot(game.rewards)
-    plt.title('Game Rewards')
-    plt.xlabel('Step')
-    plt.ylabel('Reward')
-    plt.savefig(os.path.join(save_dir, 'rewards.png'))
-    plt.close()
-
-    # Plot value estimates
-    plt.figure(figsize=(10, 5))
-    plt.plot(game.values)
-    plt.title('MCTS Value Estimates')
-    plt.xlabel('Step')
-    plt.ylabel('Value')
-    plt.savefig(os.path.join(save_dir, 'values.png'))
-    plt.close()
-
-    # Plot policy entropy
-    entropies = [-np.sum(p * np.log(p + 1e-8)) for p in game.policies]
-    plt.figure(figsize=(10, 5))
-    plt.plot(entropies)
-    plt.title('Policy Entropy')
-    plt.xlabel('Step')
-    plt.ylabel('Entropy')
-    plt.savefig(os.path.join(save_dir, 'policy_entropy.png'))
-    plt.close()
-
-def profile_performance(trainer: MuZeroTrainer, num_steps: int = 100):
-    """Profile training performance."""
-    import cProfile
-    import pstats
-
-    profiler = cProfile.Profile()
-    profiler.enable()
-
-    # Run training steps
-    for _ in range(num_steps):
-        trainer.training_step += 1
-        trainer.update_weights()
-
-    profiler.disable()
-    stats = pstats.Stats(profiler).sort_stats('cumulative')
-    stats.print_stats(50)  # Print top 50 time-consuming operations
-
-def debug_network_outputs(trainer: MuZeroTrainer, observation: np.ndarray):
-    """Debug network predictions for a given observation."""
-    observation_tensor = trainer.prepare_observation(observation)
-
-    with torch.no_grad():
-        # Initial inference
-        initial_output = trainer.network.initial_inference(observation_tensor)
-
-        print("Initial Inference:")
-        print(f"Value: {initial_output.scalar_value():.3f}")
-        print(f"Policy logits shape: {initial_output.policy_logits.shape}")
-        print(f"Policy distribution:\n{torch.softmax(initial_output.policy_logits, dim=1).cpu().numpy()}")
-
-        # Recurrent inference
-        action = torch.tensor([[0]], device=device)  # Test with action 0
-        recurrent_output = trainer.network.recurrent_inference(initial_output.hidden_state, action)
-
-        print("\nRecurrent Inference:")
-        print(f"Value: {recurrent_output.scalar_value():.3f}")
-        print(f"Reward: {recurrent_output.scalar_reward():.3f}")
-        print(f"Policy distribution:\n{torch.softmax(recurrent_output.policy_logits, dim=1).cpu().numpy()}")
-
-def export_model_architecture(network: MuZeroNetwork, save_path: str = 'model_architecture.txt'):
-    """Export detailed model architecture."""
-    with open(save_path, 'w') as f:
-        f.write(str(network))
-
-        # Calculate number of parameters
-        total_params = sum(p.numel() for p in network.parameters())
-        trainable_params = sum(p.numel() for p in network.parameters() if p.requires_grad)
-
-        f.write(f"\n\nTotal parameters: {total_params:,}")
-        f.write(f"\nTrainable parameters: {trainable_params:,}")
-
-        # Memory usage estimation
-        param_size = sum(p.nelement() * p.element_size() for p in network.parameters())
-        buffer_size = sum(b.nelement() * b.element_size() for b in network.buffers())
-        size_mb = (param_size + buffer_size) / 1024 / 1024
-
-        f.write(f"\nEstimated model size: {size_mb:.2f} MB")

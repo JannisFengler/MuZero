@@ -4,6 +4,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model import (MuZeroNetwork, MCTS, select_action, MinMaxStats, Node,
                    ReplayBuffer, MuZeroConfig, scalar_to_support_loss)
 import gymnasium as gym
+import ale_py
 from gymnasium.wrappers import AtariPreprocessing, ResizeObservation
 import numpy as np
 import os
@@ -15,6 +16,9 @@ from collections import deque
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Register ALE environments with gymnasium
+gym.register_envs(ale_py)
+
 class CustomFrameStack(gym.Wrapper):
     """A custom frame stack wrapper that stacks the last num_stack frames.
     Assumes the environment returns observations in (H,W,C) format.
@@ -24,9 +28,7 @@ class CustomFrameStack(gym.Wrapper):
         self.num_stack = num_stack
         self.frames = deque(maxlen=num_stack)
 
-        # The original observation space
         original_obs_space = env.observation_space
-        # Assuming original obs space is (H, W, C)
         h, w, c = original_obs_space.shape
         low = np.repeat(original_obs_space.low, num_stack, axis=2)
         high = np.repeat(original_obs_space.high, num_stack, axis=2)
@@ -39,36 +41,35 @@ class CustomFrameStack(gym.Wrapper):
         )
 
     def reset(self, **kwargs):
+        logging.debug("CustomFrameStack reset called.")
         obs, info = self.env.reset(**kwargs)
         for _ in range(self.num_stack):
             self.frames.append(obs)
         return self._get_observation(), info
 
     def step(self, action):
+        logging.debug(f"CustomFrameStack step called with action {action}.")
         obs, reward, done, truncated, info = self.env.step(action)
         self.frames.append(obs)
         return self._get_observation(), reward, done, truncated, info
 
     def _get_observation(self):
-        # Stack frames along the last dimension
         return np.concatenate(list(self.frames), axis=2)
 
 
 class Game:
-    """Stores a single episode of interaction data."""
     def __init__(self, action_space_size: int, discount: float):
         self.environment_steps = 0
         self.actions: List[int] = []
         self.observations: List[np.ndarray] = []
         self.rewards: List[float] = []
-        self.values: List[float] = []   # Root value estimates from MCTS
-        self.policies: List[np.ndarray] = []  # MCTS policy distributions
+        self.values: List[float] = []
+        self.policies: List[np.ndarray] = []
         self.done = False
         self.action_space_size = action_space_size
         self.discount = discount
 
     def store_search_stats(self, root: Node, action_probs: Dict[int, float]):
-        """Store MCTS search results."""
         self.values.append(root.value())
         policy = np.zeros(self.action_space_size)
         for a, p in action_probs.items():
@@ -76,7 +77,6 @@ class Game:
         self.policies.append(policy)
 
     def compute_target_value(self, state_index: int, td_steps: int) -> float:
-        """Compute n-step target value."""
         value = 0.0
         discount = 1.0
         for i in range(td_steps):
@@ -91,7 +91,6 @@ class Game:
         return value
 
     def make_target(self, state_index: int, num_unroll_steps: int, td_steps: int):
-        """Create training targets for a segment of the game."""
         targets = []
         for current_index in range(state_index, state_index + num_unroll_steps + 1):
             value = self.compute_target_value(current_index, td_steps)
@@ -105,7 +104,6 @@ class Game:
         return targets
 
     def store_transition(self, action: Optional[int], observation: np.ndarray, reward: float):
-        """Store a single environment step."""
         self.actions.append(action if action is not None else 0)
         self.observations.append(observation)
         self.rewards.append(reward)
@@ -122,7 +120,7 @@ class MuZeroTrainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,  # Set DEBUG for more verbose logging
             format='%(asctime)s [%(levelname)s] %(message)s',
             handlers=[
                 logging.FileHandler(os.path.join(self.checkpoint_dir, 'training.log')),
@@ -151,22 +149,24 @@ class MuZeroTrainer:
 
         self.writer = SummaryWriter(os.path.join('runs', datetime.now().strftime('%Y%m%d-%H%M%S')))
 
+        # For debugging, use single actor
+        self.config.num_actors = 1
+
     def train(self):
         try:
             while self.training_step < self.config.training_steps:
-                # Generate self-play if buffer not ready
                 if len(self.replay_buffer) < self.config.batch_size:
+                    logging.info("Not enough data in replay buffer, starting self-play.")
                     self.self_play()
 
-                # If we have enough data, do a training step
                 if len(self.replay_buffer) >= self.config.minimum_games_in_buffer:
+                    logging.info(f"Starting training step {self.training_step}")
                     self.training_step += 1
                     self.update_weights()
                     if self.training_step % self.config.checkpoint_interval == 0:
                         self.save_checkpoint()
 
-                # Periodic evaluation
-                if self.training_step % self.config.eval_interval == 0:
+                if self.training_step % self.config.eval_interval == 0 and self.training_step > 0:
                     self.evaluate()
 
         except KeyboardInterrupt:
@@ -175,9 +175,15 @@ class MuZeroTrainer:
 
     def self_play(self):
         logging.info(f"Starting self-play. Buffer size: {len(self.replay_buffer)}")
-
-        with ThreadPoolExecutor(max_workers=self.config.num_actors) as executor:
-            games = list(executor.map(self.play_game, range(self.config.num_actors)))
+        # No parallelization or single-actor mode is safer:
+        # If you want parallelization later, try one actor first.
+        # If needed, comment the executor code and just call self.play_game(0) in a loop.
+        # For debugging:
+        games = []
+        for actor_id in range(self.config.num_actors):
+            logging.debug(f"Starting self-play for actor {actor_id}")
+            g = self.play_game(actor_id)
+            games.append(g)
 
         for game in games:
             priorities = self.compute_priorities(game)
@@ -185,26 +191,28 @@ class MuZeroTrainer:
             self.total_rewards.append(sum(game.rewards))
             self.num_played_games += 1
             self.num_played_steps += game.environment_steps
-
         self.log_self_play_metrics(games)
 
     def play_game(self, thread_id: int) -> Game:
-        """Execute one self-play game."""
+        logging.debug(f"play_game called by actor {thread_id}")
         env = self.make_env()
+        logging.debug("Environment created successfully.")
         obs, info = env.reset()
+        logging.debug("Environment reset complete.")
         game = Game(self.config.action_space_size, self.config.discount)
         game.store_transition(None, obs, 0)
+
         done = False
         truncated = False
 
+        step_count = 0
         while not (done or truncated) and len(game.actions) < self.config.max_moves:
-            # Prepare observation (32 frames stacked in CustomFrameStack)
+            logging.debug(f"Actor {thread_id} step {step_count}, actions so far: {len(game.actions)}")
             observation_tensor = self.prepare_observation(obs)
-
             with torch.no_grad():
                 network_output = self.network.initial_inference(observation_tensor)
-                root = Node(0, None)
-                root.expand(list(range(self.config.action_space_size)), network_output)
+            root = Node(0, None)
+            root.expand(list(range(self.config.action_space_size)), network_output)
 
             root.add_exploration_noise(
                 dirichlet_alpha=self.config.root_dirichlet_alpha,
@@ -219,16 +227,22 @@ class MuZeroTrainer:
             temperature = self.config.visit_softmax_temperature_fn(self.training_step)
             action = select_action(self.config, root, temperature)
 
+            logging.debug(f"Actor {thread_id}: taking action {action}.")
             obs, reward, done, truncated, info = env.step(action)
+            logging.debug(f"Actor {thread_id} step result: reward={reward}, done={done}, truncated={truncated}")
             game.store_transition(action, obs, reward)
+            step_count += 1
 
+        logging.info(f"Actor {thread_id} finished game with total reward {sum(game.rewards)} and {len(game.actions)} actions.")
         return game
 
     def update_weights(self):
+        logging.info("Starting update_weights")
         batch, indices, weights = self.replay_buffer.sample_batch(
             self.config.num_unroll_steps,
             self.config.td_steps
         )
+        logging.debug("Batch sampled from replay buffer.")
 
         value_loss, reward_loss, policy_loss, total_loss_per_sample = self.compute_losses(batch, weights)
         total_loss_scalar = total_loss_per_sample.mean()
@@ -239,12 +253,15 @@ class MuZeroTrainer:
         self.optimizer.step()
         self.scheduler.step()
 
+        logging.debug("Weights updated successfully.")
+
         priorities = total_loss_per_sample.detach().cpu().numpy()
         self.replay_buffer.update_priorities(indices, priorities)
 
         self.log_training_metrics(value_loss.item(), reward_loss.item(), policy_loss.item(), total_loss_scalar.item())
 
     def compute_losses(self, batch, weights):
+        logging.debug("Computing losses.")
         observations, actions_list, targets_list = zip(*batch)
         batch_size = len(observations)
         observations_tensor = torch.stack([self.prepare_observation(obs) for obs in observations]).to(device)
@@ -270,7 +287,6 @@ class MuZeroTrainer:
                     target_rewards.append(r)
                     target_policies.append(p)
                 else:
-                    # Past end of episode, absorbing state
                     target_values.append(0)
                     target_rewards.append(0)
                     target_policies.append(np.zeros(self.config.action_space_size))
@@ -301,7 +317,6 @@ class MuZeroTrainer:
             total_loss_per_sample += total_loss * weights
 
             if t < self.config.num_unroll_steps:
-                # Recurrent inference for next step
                 network_output = self.network.recurrent_inference(hidden_state, actions_tensor)
                 hidden_state = network_output.hidden_state
 
@@ -324,25 +339,29 @@ class MuZeroTrainer:
         rewards = []
         env = self.make_env()
 
-        for _ in range(self.config.eval_episodes):
+        for ep in range(self.config.eval_episodes):
+            logging.debug(f"Evaluation episode {ep}")
             obs, info = env.reset()
             done = False
             truncated = False
             total_reward = 0
+            step_count = 0
             while not (done or truncated):
                 observation_tensor = self.prepare_observation(obs)
                 with torch.no_grad():
                     network_output = self.network.initial_inference(observation_tensor)
-                    root = Node(0, None)
-                    root.expand(list(range(self.config.action_space_size)), network_output)
+                root = Node(0, None)
+                root.expand(list(range(self.config.action_space_size)), network_output)
 
-                    mcts = MCTS(self.config)
-                    min_max_stats = MinMaxStats()
-                    action_probs = mcts.run(root, self.config.action_space_size, self.network, min_max_stats)
-                    action = select_action(self.config, root, temperature=0)
+                mcts = MCTS(self.config)
+                min_max_stats = MinMaxStats()
+                action_probs = mcts.run(root, self.config.action_space_size, self.network, min_max_stats)
+                action = select_action(self.config, root, temperature=0)
 
                 obs, reward, done, truncated, info = env.step(action)
                 total_reward += reward
+                step_count += 1
+            logging.info(f"Evaluation episode {ep} finished with reward {total_reward}, steps={step_count}")
             rewards.append(total_reward)
 
         self.log_eval_metrics(rewards)
@@ -363,18 +382,20 @@ class MuZeroTrainer:
         logging.info(f"Saved checkpoint to {path}")
 
     def make_env(self):
+        logging.debug("Creating environment.")
         env = gym.make(self.config.env_name)
-        # Follow a similar setting to MuZero on Atari: no terminal on life loss, no scaling
+        logging.debug("Base environment created.")
         env = AtariPreprocessing(env, frame_skip=1, grayscale_obs=False, scale_obs=False)
+        logging.debug("AtariPreprocessing wrapper applied.")
         env = ResizeObservation(env, (96, 96))
-        # Use our custom frame stack
+        logging.debug("ResizeObservation wrapper applied.")
         env = CustomFrameStack(env, num_stack=32)  # Stack 32 frames
+        logging.debug("CustomFrameStack wrapper applied. Environment ready.")
         return env
 
     def prepare_observation(self, observation: np.ndarray) -> torch.Tensor:
-        # observation shape: (H=96, W=96, C=96) after stacking 32 RGB frames (32*3=96 channels)
         obs = np.array(observation)
-        obs = np.transpose(obs, (2, 0, 1))  # (C,H,W)
+        obs = np.transpose(obs, (2, 0, 1))
         obs = obs / 255.0
         return torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -394,6 +415,7 @@ class MuZeroTrainer:
         self.writer.add_scalar('SelfPlay/AverageLength', np.mean(lengths), self.training_step)
         self.writer.add_scalar('SelfPlay/GamesPlayed', self.num_played_games, self.training_step)
         self.writer.add_scalar('SelfPlay/TotalSteps', self.num_played_steps, self.training_step)
+        logging.info(f"Self-play complete: AvgReward={np.mean(rewards):.2f}, GamesPlayed={self.num_played_games}, TotalSteps={self.num_played_steps}")
 
     def log_training_metrics(self, value_loss: float, reward_loss: float,
                              policy_loss: float, total_loss: float):
@@ -403,6 +425,7 @@ class MuZeroTrainer:
         self.writer.add_scalar('Loss/Total', total_loss, self.training_step)
         self.writer.add_scalar('Training/LearningRate', self.optimizer.param_groups[0]['lr'], self.training_step)
         self.writer.add_scalar('Training/ReplayBufferSize', len(self.replay_buffer), self.training_step)
+        logging.info(f"Training metrics at step {self.training_step}: ValueLoss={value_loss}, RewardLoss={reward_loss}, PolicyLoss={policy_loss}, TotalLoss={total_loss}")
 
     def log_eval_metrics(self, rewards: List[float]):
         avg_reward = np.mean(rewards)
@@ -412,15 +435,12 @@ class MuZeroTrainer:
 
 
 def main():
-    # Example on how to start training:
     config = MuZeroConfig()
-    # Customize config as needed, for example:
     config.env_name = "ALE/Pong-v5"
     env = gym.make(config.env_name)
     config.action_space_size = env.action_space.n
-    config.observation_shape = (96, 96, 96)  # (C,H,W) = 96 channels from 32 RGB frames
+    config.observation_shape = (96, 96, 96)
 
-    # Start training
     trainer = MuZeroTrainer(config)
     trainer.train()
 

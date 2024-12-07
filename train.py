@@ -3,16 +3,55 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from model import (MuZeroNetwork, MCTS, select_action, MinMaxStats, Node,
                    ReplayBuffer, MuZeroConfig, scalar_to_support_loss)
-import gym
-from gym.wrappers import AtariPreprocessing, FrameStack, ResizeObservation
+import gymnasium as gym
+from gymnasium.wrappers import AtariPreprocessing, ResizeObservation
 import numpy as np
 import os
 from datetime import datetime
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Dict, Optional
+from collections import deque
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class CustomFrameStack(gym.Wrapper):
+    """A custom frame stack wrapper that stacks the last num_stack frames.
+    Assumes the environment returns observations in (H,W,C) format.
+    The stacked observation will be (H,W,C*num_stack)."""
+    def __init__(self, env, num_stack: int):
+        super().__init__(env)
+        self.num_stack = num_stack
+        self.frames = deque(maxlen=num_stack)
+
+        # The original observation space
+        original_obs_space = env.observation_space
+        # Assuming original obs space is (H, W, C)
+        h, w, c = original_obs_space.shape
+        low = np.repeat(original_obs_space.low, num_stack, axis=2)
+        high = np.repeat(original_obs_space.high, num_stack, axis=2)
+
+        self.observation_space = gym.spaces.Box(
+            low=low.min(),
+            high=high.max(),
+            shape=(h, w, c * num_stack),
+            dtype=original_obs_space.dtype
+        )
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        for _ in range(self.num_stack):
+            self.frames.append(obs)
+        return self._get_observation(), info
+
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        self.frames.append(obs)
+        return self._get_observation(), reward, done, truncated, info
+
+    def _get_observation(self):
+        # Stack frames along the last dimension
+        return np.concatenate(list(self.frames), axis=2)
 
 
 class Game:
@@ -152,14 +191,15 @@ class MuZeroTrainer:
     def play_game(self, thread_id: int) -> Game:
         """Execute one self-play game."""
         env = self.make_env()
+        obs, info = env.reset()
         game = Game(self.config.action_space_size, self.config.discount)
-        observation = env.reset()
-        game.store_transition(None, observation, 0)
+        game.store_transition(None, obs, 0)
         done = False
+        truncated = False
 
-        while not done and len(game.actions) < self.config.max_moves:
-            # Prepare observation (32 frames stacked in FrameStack)
-            observation_tensor = self.prepare_observation(observation)
+        while not (done or truncated) and len(game.actions) < self.config.max_moves:
+            # Prepare observation (32 frames stacked in CustomFrameStack)
+            observation_tensor = self.prepare_observation(obs)
 
             with torch.no_grad():
                 network_output = self.network.initial_inference(observation_tensor)
@@ -179,8 +219,8 @@ class MuZeroTrainer:
             temperature = self.config.visit_softmax_temperature_fn(self.training_step)
             action = select_action(self.config, root, temperature)
 
-            observation, reward, done, _ = env.step(action)
-            game.store_transition(action, observation, reward)
+            obs, reward, done, truncated, info = env.step(action)
+            game.store_transition(action, obs, reward)
 
         return game
 
@@ -285,11 +325,12 @@ class MuZeroTrainer:
         env = self.make_env()
 
         for _ in range(self.config.eval_episodes):
-            observation = env.reset()
+            obs, info = env.reset()
             done = False
+            truncated = False
             total_reward = 0
-            while not done:
-                observation_tensor = self.prepare_observation(observation)
+            while not (done or truncated):
+                observation_tensor = self.prepare_observation(obs)
                 with torch.no_grad():
                     network_output = self.network.initial_inference(observation_tensor)
                     root = Node(0, None)
@@ -300,7 +341,7 @@ class MuZeroTrainer:
                     action_probs = mcts.run(root, self.config.action_space_size, self.network, min_max_stats)
                     action = select_action(self.config, root, temperature=0)
 
-                observation, reward, done, _ = env.step(action)
+                obs, reward, done, truncated, info = env.step(action)
                 total_reward += reward
             rewards.append(total_reward)
 
@@ -326,7 +367,8 @@ class MuZeroTrainer:
         # Follow a similar setting to MuZero on Atari: no terminal on life loss, no scaling
         env = AtariPreprocessing(env, frame_skip=1, grayscale_obs=False, scale_obs=False)
         env = ResizeObservation(env, (96, 96))
-        env = FrameStack(env, num_stack=32)  # Stack 32 frames
+        # Use our custom frame stack
+        env = CustomFrameStack(env, num_stack=32)  # Stack 32 frames
         return env
 
     def prepare_observation(self, observation: np.ndarray) -> torch.Tensor:

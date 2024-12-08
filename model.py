@@ -333,7 +333,8 @@ class Node:
 
     def expand(self, actions: List[int], network_output: 'NetworkOutput'):
         self.expanded_flag = True
-        policy = torch.softmax(network_output.policy_logits, dim=1).cpu().numpy()[0]
+        # Detach before converting to numpy
+        policy = torch.softmax(network_output.policy_logits, dim=1).detach().cpu().numpy()[0]
         self.hidden_state = network_output.hidden_state
         self.reward = network_output.scalar_reward() if network_output.reward is not None else 0
         for action in actions:
@@ -350,7 +351,7 @@ class MCTS:
     def __init__(self, config: MuZeroConfig):
         self.config = config
 
-    def run(self, root: Node, action_space_size: int, network: MuZeroNetwork, min_max_stats: MinMaxStats) -> Dict[int, float]:
+    def run(self, root: 'Node', action_space_size: int, network: MuZeroNetwork, min_max_stats: MinMaxStats) -> Dict[int, float]:
         for _ in range(self.config.num_simulations):
             node = root
             search_path = [node]
@@ -378,7 +379,7 @@ class MCTS:
         action_probs = {a: vc / sum_visits for vc, a in visit_counts}
         return action_probs
 
-    def select_child(self, node: Node, min_max_stats: MinMaxStats) -> Tuple[int, Node]:
+    def select_child(self, node: 'Node', min_max_stats: MinMaxStats) -> Tuple[int, 'Node']:
         max_score = -float('inf')
         best_action = -1
         best_child = None
@@ -390,7 +391,7 @@ class MCTS:
                 best_child = child
         return best_action, best_child
 
-    def ucb_score(self, parent: Node, child: Node, min_max_stats: MinMaxStats) -> float:
+    def ucb_score(self, parent: 'Node', child: 'Node', min_max_stats: MinMaxStats) -> float:
         pb_c = math.log((parent.visit_count + self.config.pb_c_base + 1) / self.config.pb_c_base) + self.config.pb_c_init
         pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
         prior_score = pb_c * child.prior
@@ -400,7 +401,7 @@ class MCTS:
             value_score = 0
         return prior_score + value_score
 
-    def backpropagate(self, search_path: List[Node], value: float, discount: float, min_max_stats: MinMaxStats):
+    def backpropagate(self, search_path: List['Node'], value: float, discount: float, min_max_stats: MinMaxStats):
         for node in reversed(search_path):
             node.value_sum += value
             node.visit_count += 1
@@ -408,7 +409,7 @@ class MCTS:
             value = node.reward + discount * value
 
 
-def select_action(config: MuZeroConfig, root: Node, temperature: float = 1.0) -> int:
+def select_action(config: MuZeroConfig, root: 'Node', temperature: float = 1.0) -> int:
     visit_counts = np.array([child.visit_count for child in root.children.values()])
     actions = list(root.children.keys())
 

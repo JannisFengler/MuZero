@@ -10,7 +10,6 @@ import numpy as np
 import os
 from datetime import datetime
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Dict, Optional
 from collections import deque
 
@@ -41,14 +40,16 @@ class CustomFrameStack(gym.Wrapper):
         )
 
     def reset(self, **kwargs):
-        logging.debug("CustomFrameStack reset called.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("CustomFrameStack reset called.")
         obs, info = self.env.reset(**kwargs)
         for _ in range(self.num_stack):
             self.frames.append(obs)
         return self._get_observation(), info
 
     def step(self, action):
-        logging.debug(f"CustomFrameStack step called with action {action}.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"CustomFrameStack step called with action {action}.")
         obs, reward, done, truncated, info = self.env.step(action)
         self.frames.append(obs)
         return self._get_observation(), reward, done, truncated, info
@@ -114,13 +115,14 @@ class Game:
 
 
 class MuZeroTrainer:
-    def __init__(self, config: MuZeroConfig):
+    def __init__(self, config: MuZeroConfig, debug: bool = True):
         self.config = config
         self.checkpoint_dir = os.path.join('checkpoints', datetime.now().strftime('%Y%m%d-%H%M%S'))
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
+        log_level = logging.DEBUG if debug else logging.INFO
         logging.basicConfig(
-            level=logging.DEBUG,  # Set DEBUG for more verbose logging
+            level=log_level,
             format='%(asctime)s [%(levelname)s] %(message)s',
             handlers=[
                 logging.FileHandler(os.path.join(self.checkpoint_dir, 'training.log')),
@@ -149,7 +151,7 @@ class MuZeroTrainer:
 
         self.writer = SummaryWriter(os.path.join('runs', datetime.now().strftime('%Y%m%d-%H%M%S')))
 
-        # For debugging, use single actor
+        # For debugging, use single actor by default
         self.config.num_actors = 1
 
     def train(self):
@@ -175,13 +177,12 @@ class MuZeroTrainer:
 
     def self_play(self):
         logging.info(f"Starting self-play. Buffer size: {len(self.replay_buffer)}")
-        # No parallelization or single-actor mode is safer:
-        # If you want parallelization later, try one actor first.
-        # If needed, comment the executor code and just call self.play_game(0) in a loop.
-        # For debugging:
+
+        # Single actor for simplicity
         games = []
         for actor_id in range(self.config.num_actors):
-            logging.debug(f"Starting self-play for actor {actor_id}")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Starting self-play for actor {actor_id}")
             g = self.play_game(actor_id)
             games.append(g)
 
@@ -194,11 +195,14 @@ class MuZeroTrainer:
         self.log_self_play_metrics(games)
 
     def play_game(self, thread_id: int) -> Game:
-        logging.debug(f"play_game called by actor {thread_id}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"play_game called by actor {thread_id}")
         env = self.make_env()
-        logging.debug("Environment created successfully.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Environment created successfully.")
         obs, info = env.reset()
-        logging.debug("Environment reset complete.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Environment reset complete.")
         game = Game(self.config.action_space_size, self.config.discount)
         game.store_transition(None, obs, 0)
 
@@ -207,7 +211,8 @@ class MuZeroTrainer:
 
         step_count = 0
         while not (done or truncated) and len(game.actions) < self.config.max_moves:
-            logging.debug(f"Actor {thread_id} step {step_count}, actions so far: {len(game.actions)}")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Actor {thread_id} step {step_count}, actions so far: {len(game.actions)}")
             observation_tensor = self.prepare_observation(obs)
             with torch.no_grad():
                 network_output = self.network.initial_inference(observation_tensor)
@@ -227,9 +232,11 @@ class MuZeroTrainer:
             temperature = self.config.visit_softmax_temperature_fn(self.training_step)
             action = select_action(self.config, root, temperature)
 
-            logging.debug(f"Actor {thread_id}: taking action {action}.")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Actor {thread_id}: taking action {action}.")
             obs, reward, done, truncated, info = env.step(action)
-            logging.debug(f"Actor {thread_id} step result: reward={reward}, done={done}, truncated={truncated}")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Actor {thread_id} step result: reward={reward}, done={done}, truncated={truncated}")
             game.store_transition(action, obs, reward)
             step_count += 1
 
@@ -242,7 +249,8 @@ class MuZeroTrainer:
             self.config.num_unroll_steps,
             self.config.td_steps
         )
-        logging.debug("Batch sampled from replay buffer.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Batch sampled from replay buffer.")
 
         value_loss, reward_loss, policy_loss, total_loss_per_sample = self.compute_losses(batch, weights)
         total_loss_scalar = total_loss_per_sample.mean()
@@ -253,7 +261,8 @@ class MuZeroTrainer:
         self.optimizer.step()
         self.scheduler.step()
 
-        logging.debug("Weights updated successfully.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Weights updated successfully.")
 
         priorities = total_loss_per_sample.detach().cpu().numpy()
         self.replay_buffer.update_priorities(indices, priorities)
@@ -261,7 +270,8 @@ class MuZeroTrainer:
         self.log_training_metrics(value_loss.item(), reward_loss.item(), policy_loss.item(), total_loss_scalar.item())
 
     def compute_losses(self, batch, weights):
-        logging.debug("Computing losses.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Computing losses.")
         observations, actions_list, targets_list = zip(*batch)
         batch_size = len(observations)
         observations_tensor = torch.stack([self.prepare_observation(obs) for obs in observations]).to(device)
@@ -340,7 +350,8 @@ class MuZeroTrainer:
         env = self.make_env()
 
         for ep in range(self.config.eval_episodes):
-            logging.debug(f"Evaluation episode {ep}")
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"Evaluation episode {ep}")
             obs, info = env.reset()
             done = False
             truncated = False
@@ -382,15 +393,20 @@ class MuZeroTrainer:
         logging.info(f"Saved checkpoint to {path}")
 
     def make_env(self):
-        logging.debug("Creating environment.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Creating environment.")
         env = gym.make(self.config.env_name)
-        logging.debug("Base environment created.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("Base environment created.")
         env = AtariPreprocessing(env, frame_skip=1, grayscale_obs=False, scale_obs=False)
-        logging.debug("AtariPreprocessing wrapper applied.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("AtariPreprocessing wrapper applied.")
         env = ResizeObservation(env, (96, 96))
-        logging.debug("ResizeObservation wrapper applied.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("ResizeObservation wrapper applied.")
         env = CustomFrameStack(env, num_stack=32)  # Stack 32 frames
-        logging.debug("CustomFrameStack wrapper applied. Environment ready.")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug("CustomFrameStack wrapper applied. Environment ready.")
         return env
 
     def prepare_observation(self, observation: np.ndarray) -> torch.Tensor:
@@ -441,7 +457,9 @@ def main():
     config.action_space_size = env.action_space.n
     config.observation_shape = (96, 96, 96)
 
-    trainer = MuZeroTrainer(config)
+    # Set debug=False for summarized logs, True for detailed logs
+    debug_mode = False
+    trainer = MuZeroTrainer(config, debug=debug_mode)
     trainer.train()
 
 
